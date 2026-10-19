@@ -247,6 +247,7 @@ document.querySelectorAll('#therapyBar button').forEach(b => {
         // первые секунды новой фазы дают переходный выброс/провал уровня
         occInteg = 0;
         occEma = null;
+        relPending = 0;
         renderTestReport();
     });
 });
@@ -316,6 +317,18 @@ function targetCenter(){
 // 10-с окнам сократился с ~9 до ~6 молекул, F1–F3 держат коридор во всех сидах.
 let occInteg = 0;
 let occEma = null;               // инициализируется первым замером
+// правка 5: «память» регулятора о недавнем выбросе (суммарный приток молекул
+// в щель за последнее окно оборота tauAU). Без неё контур путает запаздывание
+// системы с собственной неэффективностью: после удачного выброса уровень ещё
+// низкий (молекулы в пути/на связывании), ошибка остаётся отрицательной,
+// интеграл уползает в минимум — и следующий квант срывается. Теперь pending
+// прибавляется к EMA при расчёте ошибки — регулятор видит будущий уровень
+// и перестаёт тормозить сам себя.
+// правка 7: relPending экспоненциально «испаряется» с тем же временем tauAU,
+// что и EMA. Линейная память давала перелёты (выброс засчитывался дважды:
+// как pending и как выросший EMA) — пила 4→26 в F1. Затухающий вклад даёт
+// корректный Smith-predictor без двойного учёта.
+let relPending = 0;              // выброшено, но ещё не «доехало» в щель
 function cleftCount(){
     let n = 0;
     for (let m of molecules) if (m.state === 'cleft') n++;
@@ -326,14 +339,26 @@ function occController(dt, prm){
     if (occEma === null) occEma = n;
     const tauAU = 10;            // характерное время оборота молекул в щели, c
     occEma += (n - occEma) * Math.min(1, dt / tauAU);
+    // затухание «доезжающего» притока (см. правку 7):
+    relPending *= Math.max(0, 1 - dt / tauAU);
     const tgt = targetCenter();
-    const err = occEma - tgt;    // ошибка по сглаженному уровню, не по шуму
+    const err = (occEma + relPending) - tgt;   // ошибка по сглаженному уровню + pipeline
     occInteg += err * dt;
+    // правка 7b: anti-windup — интеграл не копит ошибку, когда ручка упёрлась
+    // в насыщение регулятора (иначе после долгого провала нужен целый цикл
+    // «разворота», что и давало медленные автоколебания уровня).
+// правка 9: усиление интегральной части (0.10 -> 0.25). Диагностика реального
+// кода показала: при блокаде SERT 92% и редких Ca-событиях «топливо» в щель
+// поступает квантами по 4 молекулы; слабый I-член не успевал поднять частоту
+// событий между окнами оборота, и F1/F3 стабильно недобирали до коридора
+// (средн. 8.9 / 20.8 при цели 19-28). С I=0.25 статика снимается за ~1 цикл.
+    const raw = 1 + 0.35 * err + 0.25 * occInteg;
+    if (raw > 3.0 && occInteg > 0 || raw < 0.25 && occInteg < 0) {
+        occInteg -= err * dt;    // откатить накопление на этом шаге
+    }
     occInteg = Math.max(-3, Math.min(3, occInteg));
-    // Интегральный член усилен (0.08 -> 0.15): снимает статическое смещение,
-    // из-за которого F3 висела у нижней границы коридора (средн. 17 при 19-28).
-    const out = 1 + 0.25 * err + 0.15 * occInteg;   // P + I
-    return Math.max(0.2, Math.min(4.0, out));
+    const out = raw;             // P + I
+    return Math.max(0.25, Math.min(3.0, out));
 }
 
 // ===== ТЕСТОВЫЙ ЖУРНАЛ (для снятия контрольных значений текстом) =====
@@ -416,10 +441,16 @@ function update(dt) {
     if (synTimer > 0.5 / prm.synth) { synTimer = 0; spawnTrp(); }
 
     const caActive = calciumEvents.some(e => e.active && e.t < e.duration);
-    // правка 4c/4d: ПИ-коррекция частоты Ca2+-событий по ошибке занятости щели
+    // правка 4c/4d/5: ПИ-коррекция частоты Ca2+-событий и p(fusion) по ошибке
+    // занятости щели (ошибка считается с учётом «доезжающих» выбросов).
     const occGain = occController(dt, prm);
-    // правка 4d: вторая ручка контура — вероятность слияния (release probability)
-    relProb = Math.min(1.0, RELPROB_BASE[targetPhase] * (0.5 + 0.5 * occGain));
+    // правка 5a: relProb ограничена снизу физиологическим минимумом 0.6
+    // (базальная вероятность слияния в активной зоне), сверху — 1.0.
+    // правка 8: перенос «топливной» части регулятора на частоту Ca2+-событий.
+    // Ручка relProb оставлена почти постоянной (узкий коридор 0.75–1.0):
+    // при сильной модуляции обеих ручек контур получал суммарный коэффициент
+    // err² и входил в медленные автоколебания (провалы F0/F1 до 3–5 молекул).
+    relProb = Math.max(0.75, Math.min(1.0, RELPROB_BASE[targetPhase] * (0.9 + 0.1 * occGain)));
     caTimer += dt;
     if (!caActive && caTimer > prm.caInterval * (0.8 + Math.random() * 0.4) / occGain) {
         caTimer = 0;
@@ -476,7 +507,23 @@ function update(dt) {
                 // правка 4d: вероятность квантового выброса (release probability).
                 // Неудачное слияние = везикула возвращается, не опорожняясь
                 // (физически: standby-состояние active zone, ~50% событий в контроле).
+// правка 10: физика квантового выброса. В реальном синапсе при блокаде SERT
+// везикулы успевают наполняться (VMAT не ждёт захвата — цитозольный пул
+// пополняется синтезом), и каждый Ca2+-триггер даёт полный квант ~4 молекулы.
+// Раньше при 92% блокады везикулы приходили на докинг полупустыми (count 1-2),
+// и даже редкие события давали мало «топлива» — F1/F3 недобирали до коридора,
+// а PI-регулятор выкручивал ручку в насыщение и раскачивал систему.
+// Теперь перед слиянием везикула дозаполняется из цитозольного пула:
+// сколько реально удалось упаковать — столько и уходит в щель (физично:
+// VMAT работает весь межквантовый интервал).
                 if (Math.random() < relProb) {
+                    // дозаправка везикулы из цитозоля (не больше VES_FULL)
+                    let cyto = molecules.filter(mm => mm.state === 'cytosol' && !mm.degradation);
+                    while (v.count < VES_FULL && cyto.length > 0) {
+                        const pick = cyto.pop();
+                        pick.dead = true;
+                        v.count++;
+                    }
                     const spawnY = CLEFT_TOP + 10;
                     for (let k = 0; k < v.count; k++) {
                         const mm = new Mol(DOCK.x + (Math.random() - 0.5) * 40, spawnY + Math.random() * 12, 'cleft');
@@ -484,6 +531,8 @@ function update(dt) {
                     }
                     ringAdd('rel'); ring.rel[ringIdx] += v.count - 1;
                     secRelAcc += v.count;
+                    // правка 5: учёт «доезжающего» притока для регулятора
+                    relPending += v.count;
                     v.count = 0;
                 }
                 v.state = 'returning'; v.t = 0;
@@ -538,6 +587,37 @@ function update(dt) {
         }
         else if (m.state === 'cytosol') {
             wander(m, dt, 130);
+            // правка 6: мягкие стенки пресинаптического терминаля.
+            // Эллипс (PRE_CX,PRE_CY,PRE_RX,PRE_RY) — физическая граница нейрита:
+            // раньше молекула «прилипала» к стенке и дёргалась рывками внутрь.
+            // Теперь скорость раскладывается на нормаль/касательную к эллипсу:
+            // нормальная компонента отражается плавно (пружина + демпфирование),
+            // касательная сохраняется — молекула скользит вдоль мембраны, как
+            // броуновская частица у стенки (отражение в противоположную сторону
+            // без телепортации к центру).
+            const wall = 8;                       // толщина пристенечного слоя, px
+            const ex = (m.x - PRE_CX) / PRE_RX, ey = (m.y - PRE_CY) / PRE_RY;
+            const eNorm = Math.sqrt(ex*ex + ey*ey);   // <1 внутри, =1 на стенке
+            if (eNorm > 1 - wall/Math.min(PRE_RX, PRE_RY)) {
+                // внешняя нормаль эллипса: градиент (x²/a²+y²/b²)
+                let nx = ex / PRE_RX, ny = ey / PRE_RY;
+                const nl = Math.hypot(nx, ny) || 1; nx /= nl; ny /= nl;
+                if (eNorm > 1) {                  // вышла за стенку — вернуть на границу
+                    m.x = PRE_CX + ex / eNorm * PRE_RX;
+                    m.y = PRE_CY + ey / eNorm * PRE_RY;
+                }
+                const vn = m.vx * nx + m.vy * ny; // нормальная компонента скорости
+                if (vn > 0) {                     // движется к стенке — отражаем
+                    m.vx -= 2 * vn * nx;          // зеркальное отражение
+                    m.vy -= 2 * vn * ny;
+                    m.vx *= 0.85; m.vy *= 0.85;   // лёгкое демпфирование (упругость мембраны)
+                }
+                // упругий отпор от стенки (закон Гука в пристенечном слое)
+                const push = 40 * Math.max(0, eNorm - (1 - wall/Math.min(PRE_RX, PRE_RY))) / (wall/Math.min(PRE_RX, PRE_RY));
+                m.vx -= nx * push * dt * 10;
+                m.vy -= ny * push * dt * 10;
+            }
+            if (m.degradation && !insidePre(m.x, m.y, 10)) { m.x = PRE_CX + ex/Math.max(eNorm,1e-6)*PRE_RX*0.9; m.y = PRE_CY + ey/Math.max(eNorm,1e-6)*PRE_RY*0.9; }
             if (!m.degradation && m.life > 2.0) {
                 const overload = Math.max(0, cytosolCount - 15);
                 const rate = (0.15 + 0.05 * overload) * prm.mao;
@@ -560,10 +640,15 @@ function update(dt) {
             if (best) {
                 const pos = barrelPos(bi, revolverDisplay);
                 const dx = pos.x - m.x, dy = pos.y - m.y, d = dist(m.x, m.y, pos.x, pos.y) || 1;
-                m.vx += dx / d * 180 * dt; m.vy += dy / d * 180 * dt;
-                if (d < 26) { best.count++; m.dead = true; continue; }
+                // правка 6b: упаковка только в пределах досягаемости терминаля —
+                // раньше притяжение к VMAT растащивало цитозольные молекулы за
+                // стенки нейрита; теперь тянем мягко и не выносим за эллипс
+                // (стенки отражают сами, см. правку 6 выше).
+                if (insidePre(pos.x, pos.y, 30)) {
+                    m.vx += dx / d * 180 * dt; m.vy += dy / d * 180 * dt;
+                    if (d < 26) { best.count++; m.dead = true; continue; }
+                }
             }
-            if (!insidePre(m.x, m.y, 25)) { m.x += (PRE_CX - m.x) * 0.08; m.y += (PRE_CY - m.y) * 0.08; }
         }
         else if (m.state === 'cleft') {
             const step = DIFFUSION_COEFF * Math.sqrt(dt);
