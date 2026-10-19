@@ -91,14 +91,14 @@ function P(){
     return {
         cortisol: 0.1+0.9*s,
         tdo: 0.03+0.32*s,
-        synth: (0.85+0.15*s) * (1 - 0.3*therapy.adapt),
-        caInterval: (0.9-0.35*s) * (1 + 0.8 * therapy.block * (1 - therapy.desens)),
+        synth: (1.6+0.3*s) * (1 - 0.15*therapy.adapt),   // правка 13c
+        caInterval: (0.9-0.35*s) * (1 + 0.35 * therapy.block * (1 - therapy.desens)),  // правка 13c
         sert: 1.0+0.5*s,
         mao: 1.0+0.5*s,
         autoSens: (0.45 + 0.55*s) * (1 - 0.9*therapy.desens),
-        ht1a: (1.0-0.6*s) * (1 + 0.5*therapy.adapt),
-        ht2a: (1.0+0.8*s) * (1 - 0.45*therapy.adapt),
-        ht3:  (1 - 0.3*therapy.adapt),
+        ht1a: (0.30-0.10*s) * (1 + 0.5*therapy.adapt),   // правка 13b
+        ht2a: (1.0+0.2*s) * (1 - 0.15*therapy.adapt),    // правка 13b
+        ht3:  (0.8 - 0.2*therapy.adapt),
         kynShift: 0.6+0.25*s,
         maoFraction: 0.45+0.3*s
     };
@@ -144,9 +144,9 @@ const DOCK = {x: 520, y: CLEFT_TOP - 12};
 
 let revolverRotation = 0, revolverDisplay = 0;
 let vesicles = [
-    {count: 2, pool: 'RRP', speed: 1.0, t: 0, state: 'barrel', x: 0, y: 0},
-    {count: 2, pool: 'Rec', speed: 0.8, t: 0, state: 'barrel', x: 0, y: 0},
-    {count: 2, pool: 'Res', speed: 0.5, t: 0, state: 'barrel', x: 0, y: 0}
+    {count: 4, pool: 'RRP', speed: 1.0, t: 0, state: 'barrel', x: 0, y: 0},
+    {count: 4, pool: 'Rec', speed: 0.8, t: 0, state: 'barrel', x: 0, y: 0},
+    {count: 4, pool: 'Res', speed: 0.5, t: 0, state: 'barrel', x: 0, y: 0}
 ];
 
 const serts = [
@@ -157,9 +157,9 @@ let sertRerollTimer = 0;
 const autoRec = {x: 710, y: CLEFT_TOP, occupied: null, t: 0, active: false, activeT: 0, pulse: 0};
 
 const postRecs = [
-    {x: 420, y: CLEFT_BOT - 5, type: '5-HT1A (Gi)',   aff: 3.0,  color: '#4488ff', radius: 21, bindings: 0, flash: 0, occ: null, t: 0},
-    {x: 540, y: CLEFT_BOT - 5, type: '5-HT2A (Gq)',   aff: 0.8,  color: '#ff8844', radius: 21, bindings: 0, flash: 0, occ: null, t: 0},
-    {x: 620, y: CLEFT_BOT - 5, type: '5-HT3 (канал)', aff: 0.25, color: '#ffdd00', radius: 21, bindings: 0, flash: 0, occ: null, t: 0}
+    {x: 420, y: CLEFT_BOT - 5, type: '5-HT1A (Gi)',   aff: 0.9,  color: '#4488ff', radius: 21, bindings: 0, flash: 0, occ: null, t: 0},
+    {x: 540, y: CLEFT_BOT - 5, type: '5-HT2A (Gq)',   aff: 1.7,  color: '#ff8844', radius: 21, bindings: 0, flash: 0, occ: null, t: 0},
+    {x: 620, y: CLEFT_BOT - 5, type: '5-HT3 (канал)', aff: 0.2, color: '#ffdd00', radius: 21, bindings: 0, flash: 0, occ: null, t: 0}
 ];
 
 const SYN = {trp: [220, 60], branch: [250, 100], htp: [360, 160], ht: [400, 200]};
@@ -294,7 +294,7 @@ const FIXED_TARGETS = [
 // при block=92% (Ф1–Ф3) «топливо» для выброса ограничено и удержание нижней
 // половины коридора физически недостижимо — цель ставится на верхнюю половину.
 // Величины получены автоподбором по броуновской реплике (усреднение по сидам).
-const PHASE_BIAS = [0, +3, +1, +2];   // F3: смещён вверх — при 92% блоке SERT
+const PHASE_BIAS = [0, +3, 0, +2];   // F3: смещён вверх — при 92% блоке SERT
                                       // нижняя половина коридора физически
                                       // недостижима (по автоподбору реплики)
 // Правка 4d: вторая ручка контура — вероятность слияния (release probability),
@@ -722,7 +722,7 @@ function update(dt) {
             // (физически: выход из активационной зоны в объём вне щели)
         }
         else if (m.state === 'bound') {
-            if (m.t > 1.0 / m.target.aff) {
+            if (m.t > 0.5 + 0.5 / m.target.aff) {   // правка 13a
                 m.target.occ = null;
                 m.state = 'cleft';
                 m.t = 0;
