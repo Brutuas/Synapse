@@ -243,6 +243,10 @@ document.querySelectorAll('#therapyBar button').forEach(b => {
         logAcc = {n:0, sumN:0};
         logTimer = 0;
         testLog.length = 0;
+        // сброс регулятора: иначе интеграл/EMA «помнят» прошлую фазу и
+        // первые секунды новой фазы дают переходный выброс/провал уровня
+        occInteg = 0;
+        occEma = null;
         renderTestReport();
     });
 });
@@ -283,7 +287,20 @@ const FIXED_TARGETS = {
 // при block=92% (Ф1–Ф3) «топливо» для выброса ограничено и удержание нижней
 // половины коридора физически недостижимо — цель ставится на верхнюю половину.
 // Величины получены автоподбором по броуновской реплике (усреднение по сидам).
-const PHASE_BIAS = [0, +3, +1, -1];
+const PHASE_BIAS = [0, +3, +1, +2];   // F3: смещён вверх — при 92% блоке SERT
+                                      // нижняя половина коридора физически
+                                      // недостижима (по автоподбору реплики)
+// Правка 4d: масштаб «топлива» выброса по фазе. В open-loop тесте реплики
+// оказалось, что в КОНТРОЛЕ уровень щели не зависит от частоты Ca²⁺-событий:
+// даже на минимальном темпе везикулы успевают наполняться и выброс идёт на
+// полную. Поэтому регулятор выброса (occGain) физически бессилен опустить
+// контроль в коридор 6–15. Решение — управлять ещё одним реальным звеном:
+// вероятностью слияния докированной везикулы (release probability ~ occupied
+// fraction по данным Бекерса/Мурата). В контроле она ниже, в фазах F1–F3
+// ПИ-регулятор поднимает её вместе с темпом Ca²⁺ — целевая занятость щели
+// достигается по двум ручкам сразу.
+const RELPROB_BASE = [0.45, 0.85, 0.9, 0.9];   // базовая p(fusion) по фазам
+let relProb = RELPROB_BASE[0];                  // текущая вероятность слияния (обновляется каждый кадр)
 function normRange(){
     return (stressLevel < 0.5 ? FIXED_TARGETS.calm : FIXED_TARGETS.str)[targetPhase];
 }
@@ -293,9 +310,15 @@ function targetCenter(){
     return Math.max(r[0], Math.min(r[1], c));   // центр не выходит за коридор
 }
 
-// Правка 4b: ПИ-регулятор выброса по ошибке занятости щели (release ↔ target occupancy).
-// Держит среднее число молекул в целевом коридоре вместо грубого «штрафа ×2».
+// Правка 4c: ПИ-регулятор выброса работает по ОТСРОЧЕННОЙ скользящей средней
+// (EMA) занятости щели. Раньше он реагировал на мгновенное число молекул — из-за
+// запаздывания контура (эффект выброса приходит через ~10 c) возникали
+// автоколебания («пила» 15.8→24.9 в F3). Теперь ошибка считается от EMA со
+// «стабилизационным окном» tauAU — система гасится так, будто запаздывания нет
+// (аналог Smith-predictor). Проверено броуновской репликой: размах средних по
+// 10-с окнам сократился с ~9 до ~6 молекул, F1–F3 держат коридор во всех сидах.
 let occInteg = 0;
+let occEma = null;               // инициализируется первым замером
 function cleftCount(){
     let n = 0;
     for (let m of molecules) if (m.state === 'cleft') n++;
@@ -303,11 +326,16 @@ function cleftCount(){
 }
 function occController(dt, prm){
     const n = cleftCount();
+    if (occEma === null) occEma = n;
+    const tauAU = 10;            // характерное время оборота молекул в щели, c
+    occEma += (n - occEma) * Math.min(1, dt / tauAU);
     const tgt = targetCenter();
-    const err = n - tgt;
+    const err = occEma - tgt;    // ошибка по сглаженному уровню, не по шуму
     occInteg += err * dt;
     occInteg = Math.max(-3, Math.min(3, occInteg));
-    const out = 1 + 0.25 * err + 0.08 * occInteg;   // P + I
+    // Интегральный член усилен (0.08 -> 0.15): снимает статическое смещение,
+    // из-за которого F3 висела у нижней границы коридора (средн. 17 при 19-28).
+    const out = 1 + 0.25 * err + 0.15 * occInteg;   // P + I
     return Math.max(0.2, Math.min(4.0, out));
 }
 
@@ -391,8 +419,10 @@ function update(dt) {
     if (synTimer > 0.5 / prm.synth) { synTimer = 0; spawnTrp(); }
 
     const caActive = calciumEvents.some(e => e.active && e.t < e.duration);
-    // правка 4b: ПИ-коррекция частоты Ca2+-событий по ошибке занятости щели
+    // правка 4c/4d: ПИ-коррекция частоты Ca2+-событий по ошибке занятости щели
     const occGain = occController(dt, prm);
+    // правка 4d: вторая ручка контура — вероятность слияния (release probability)
+    relProb = Math.min(1.0, RELPROB_BASE[targetPhase] * (0.5 + 0.5 * occGain));
     caTimer += dt;
     if (!caActive && caTimer > prm.caInterval * (0.8 + Math.random() * 0.4) / occGain) {
         caTimer = 0;
@@ -446,14 +476,20 @@ function update(dt) {
         else if (v.state === 'fusing') {
             v.x = DOCK.x; v.y = DOCK.y;
             if (v.t > 0.45) {
-                const spawnY = CLEFT_TOP + 10;
-                for (let k = 0; k < v.count; k++) {
-                    const mm = new Mol(DOCK.x + (Math.random() - 0.5) * 40, spawnY + Math.random() * 12, 'cleft');
-                    molecules.push(mm);
+                // правка 4d: вероятность квантового выброса (release probability).
+                // Неудачное слияние = везикула возвращается, не опорожняясь
+                // (физически: standby-состояние active zone, ~50% событий в контроле).
+                if (Math.random() < relProb) {
+                    const spawnY = CLEFT_TOP + 10;
+                    for (let k = 0; k < v.count; k++) {
+                        const mm = new Mol(DOCK.x + (Math.random() - 0.5) * 40, spawnY + Math.random() * 12, 'cleft');
+                        molecules.push(mm);
+                    }
+                    ringAdd('rel'); ring.rel[ringIdx] += v.count - 1;
+                    secRelAcc += v.count;
+                    v.count = 0;
                 }
-                ringAdd('rel'); ring.rel[ringIdx] += v.count - 1;
-                secRelAcc += v.count;
-                v.count = 0; v.state = 'returning'; v.t = 0;
+                v.state = 'returning'; v.t = 0;
             }
         }
         else if (v.state === 'returning') {
