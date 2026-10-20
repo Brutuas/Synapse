@@ -1,0 +1,1284 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Симулятор синаптической щели (5-HT) v8.3 — ФАЗЫ ТЕРАПИИ СИОЗС</title>
+<style>
+    body { margin: 0; background: #f5f5f0; font-family: 'Courier New', monospace; display: flex; flex-direction: column; justify-content: center; align-items: center; min-height: 100vh; gap: 10px; }
+    canvas { border: 2px solid #333; box-shadow: 0 0 25px rgba(0,0,0,0.15); cursor: crosshair; }
+    #modeBtn { padding: 10px 24px; font-family: 'Courier New', monospace; font-weight: bold; font-size: 14px; cursor: pointer; border: 2px solid #333; background: #d8f0d8; }
+    #modeBtn.stress { background: #f0d0d0; }
+    #therapyBar { display: flex; gap: 6px; }
+    #therapyBar button { padding: 8px 14px; font-family: 'Courier New', monospace; font-weight: bold; font-size: 12px; cursor: pointer; border: 2px solid #333; background: #e8e8e8; }
+    #therapyBar button.active { background: #ffe08a; box-shadow: inset 0 0 0 2px #b8860b; }
+</style>
+</head>
+<body>
+<div id="therapyBar">
+    <button data-ph="0" class="active">КОНТРОЛЬ (хрон. тревога, без СИОЗС)</button>
+    <button data-ph="1">Ф1 ОСТРАЯ БЛОКАДА</button>
+    <button data-ph="2">Ф2 ДЕСЕНСИТИЗАЦИЯ</button>
+    <button data-ph="3">Ф3 ПОСТАДАПТАЦИЯ</button>
+</div>
+<canvas id="cv" width="1200" height="700"></canvas>
+<div id="testPanel" style="margin-top:8px; font-family:'Courier New',monospace;">
+    <button id="btnReport" style="padding:6px 12px; font-weight:bold; cursor:pointer;">📋 ОТЧЁТ ДЛЯ КОПИРОВАНИЯ</button>
+    <button id="btnCopyLog" style="padding:6px 12px; cursor:pointer;" title="Скопировать весь журнал в буфер">⧉ Копировать всё</button>
+    <button id="btnClearLog" style="padding:6px 12px; cursor:pointer;" title="Очистить журнал (например, после переключения фазы)">✖ Очистить</button>
+    <span id="reportHint" style="font-size:12px; color:#555;"> — окно = 10 с; «OK» значит среднее в коридоре цели</span>
+    <textarea id="testReport" readonly rows="14" wrap="off"
+        style="display:none; margin-top:6px; width:100%; max-width:1200px; box-sizing:border-box;
+        font-family:'Courier New',monospace; font-size:12px; background:#0d1117; color:#3ddc3d;
+        border:2px solid #333; padding:8px; white-space:pre;"></textarea>
+</div>
+<script>
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const W = 1200, H = 700;
+
+const PRE_CX = 440, PRE_CY = 150, PRE_RX = 420, PRE_RY = 130;
+function yMem(x){ const t=(x-PRE_CX)/PRE_RX; return PRE_CY+PRE_RY*Math.sqrt(Math.max(0,1-t*t)); }
+
+const CLEFT = { x: 300, y: 280, w: 440, h: 160 };
+const CLEFT_LEFT = CLEFT.x;
+const CLEFT_RIGHT = CLEFT.x + CLEFT.w;
+const CLEFT_TOP = CLEFT.y;
+const CLEFT_BOT = CLEFT.y + CLEFT.h;
+
+// Калибровка v8.3: автоподбор координатным спуском по броуновской реплике модели
+// (D, SERT_R, REC_R, BIND, EDGE, SYNTH, AUTO_K, MAXPOP) под целевые коридоры фаз.
+const DIFFUSION_COEFF = 75;   // правка 1: D_eff (px/√с), было 50
+const BIND_RATE = 0.49;        // правка 2b: скорость связывания с постсинаптикой
+const EDGE_REFLECT = 0.96;     // правка 3: вероятность отражения от краёв щели, было 0.99
+const CLEFT_MAX_POP = 28;      // правка 1b: жёсткий потолок свободных молекул в щели (LIFO-вытеснение oldest-first)
+
+const C_5HT='#bb2222', C_5HT_RECYCLED='#881144', C_5HT_DEGRAD='#660022';
+const C_5HTP='#ee8833', C_TRP='#886622';
+const C_KYN='#7744cc', C_KYNA='#33aa66', C_QUIN='#331144';
+const C_SERT='#2266cc', C_REC='#cc2277', C_MAO='#cc3333';
+const C_AUTO='#00aa55', C_NA='#3399ff', C_CA='#44dd44', C_CORT='#ffcc00';
+const C_SSRI='#ffcc00';
+
+// НОВАЯ ЛОГИКА (правка 12): режим переключателя «СПОКОЙСТВИЕ/ТРЕВОГА» удалён.
+// КОНТРОЛЬ (F0) теперь физиологически = ХРОНИЧЕСКАЯ ТРЕВОГА: stressLevel жёстко
+// зафиксирован на базовом уровне 0.85. Лечение СИОЗС (Феварин) — фазы Ф1–Ф3,
+// в которых стресс постепенно снижается постадаптацией (prm.adaptStress).
+const STRESS_BASE = 0.85;          // хроническая тревога в контроле
+function getStress(){ return STRESS_BASE * (1 - 0.75 * therapy.adapt); }
+const NM_PER_MOL = 2;
+let tdoRamp = 0;
+let simTime = 0;
+let maoTotal = 0;
+let signaledTotal = 0;
+
+const THERAPY_PHASES = [
+    {name:'КОНТРОЛЬ',        block:0,    desens:0, adapt:0},
+    {name:'Ф1 ОСТРАЯ БЛОКАДА', block:0.92, desens:0, adapt:0},
+    {name:'Ф2 ДЕСЕНСИТИЗАЦИЯ', block:0.92, desens:1, adapt:0},
+    {name:'Ф3 ПОСТАДАПТАЦИЯ',  block:0.92, desens:1, adapt:1}
+];
+let targetPhase = 0;
+let therapy = {block:0, desens:0, adapt:0};
+
+// Правка 12b: ауторецепторная петля в контроле (хрон. тревога) должна быть
+// ГИПЕРактивной, а не «спящей»: при s≈0.85 старая формула (1-0.8*s) давала
+// autoSens≈0.32 — обратное торможение выброса почти исчезало, и вместо
+// аритмии «пик→пауза» получался ровный низкий уровень. Теперь автоSens
+// растёт со стрессом (гиперреактивные 1A-ауторецепторы при тревоге), а
+// СИОЗС-десенситизация (therapy.desens) снимает это торможение в Ф2/Ф3.
+function P(){
+    const s = getStress();
+    return {
+        cortisol: 0.1+0.9*s,
+        tdo: 0.03+0.32*s,
+        synth: (1.6+0.3*s) * (1 - 0.15*therapy.adapt),   // правка 13c
+        caInterval: (0.9-0.35*s) * (1 + 0.35 * therapy.block * (1 - therapy.desens)),  // правка 13c
+        sert: 1.0+0.5*s,
+        mao: 1.0+0.5*s,
+        autoSens: (0.45 + 0.55*s) * (1 - 0.9*therapy.desens),
+        ht1a: (0.30-0.10*s) * (1 + 0.5*therapy.adapt),   // правка 13b
+        ht2a: (1.0+0.2*s) * (1 - 0.15*therapy.adapt),    // правка 13b
+        ht3:  (0.8 - 0.2*therapy.adapt),
+        kynShift: 0.6+0.25*s,
+        maoFraction: 0.45+0.3*s
+    };
+}
+
+let molecules = [], hiaaFlashes = [], receptorFlashes = [], calciumEvents = [], cortisolMols = [];
+let time = 0;
+
+let histRel = [], histCleft = [];
+let secRelAcc = 0;
+
+const RING_N = 10;
+let ringIdx = 0, secTimer = 0;
+let ring = {};
+function ringInit(){
+    ring = { rel:Array(RING_N).fill(0), up:Array(RING_N).fill(0), syn:Array(RING_N).fill(0),
+             mao:Array(RING_N).fill(0), kyn:Array(RING_N).fill(0), kyna:Array(RING_N).fill(0),
+             quin:Array(RING_N).fill(0), diff:Array(RING_N).fill(0), lost:Array(RING_N).fill(0),
+             ev2:Array(RING_N).fill(0), ev3:Array(RING_N).fill(0), ev1:Array(RING_N).fill(0) };
+}
+ringInit();
+function ringTick(dt){
+    secTimer += dt;
+    if (secTimer >= 1.0){
+        secTimer -= 1.0;
+        ringIdx = (ringIdx+1)%RING_N;
+        for (let k in ring) ring[k][ringIdx]=0;
+        histRel.push(secRelAcc);
+        histCleft.push(molecules.filter(m => m.state === 'cleft').length);
+        if (histRel.length > 180){ histRel.shift(); histCleft.shift(); }
+        secRelAcc = 0;
+    }
+}
+function ringAdd(key){ ring[key][ringIdx]++; }
+function ringSum(key){ let s=0; for(let i=0;i<RING_N;i++) s+=ring[key][i]; return s; }
+
+const VES_FULL = 4;
+const REV_CENTER = {x: 520, y: 115};
+const REV_RADIUS = 70;
+const SLOT_ANGLES = [90, 210, 330];
+const POOL_COLORS = {'RRP':'#00aa44','Rec':'#2266cc','Res':'#888888'};
+const DOCK = {x: 520, y: CLEFT_TOP - 12};
+
+let revolverRotation = 0, revolverDisplay = 0;
+let vesicles = [
+    {count: 4, pool: 'RRP', speed: 1.0, t: 0, state: 'barrel', x: 0, y: 0},
+    {count: 4, pool: 'Rec', speed: 0.8, t: 0, state: 'barrel', x: 0, y: 0},
+    {count: 4, pool: 'Res', speed: 0.5, t: 0, state: 'barrel', x: 0, y: 0}
+];
+
+const serts = [
+    {x: 380, y: CLEFT_TOP + 5, radius: 19, flash: 0, blocked: false},
+    {x: 660, y: CLEFT_TOP + 5, radius: 19, flash: 0, blocked: false}
+];
+let sertRerollTimer = 0;
+const autoRec = {x: 710, y: CLEFT_TOP, occupied: null, t: 0, active: false, activeT: 0, pulse: 0};
+
+const postRecs = [
+    {x: 420, y: CLEFT_BOT - 5, type: '5-HT1A (Gi)',   aff: 0.9,  color: '#4488ff', radius: 21, bindings: 0, flash: 0, occ: null, t: 0},
+    {x: 540, y: CLEFT_BOT - 5, type: '5-HT2A (Gq)',   aff: 1.7,  color: '#ff8844', radius: 21, bindings: 0, flash: 0, occ: null, t: 0},
+    {x: 620, y: CLEFT_BOT - 5, type: '5-HT3 (канал)', aff: 0.2, color: '#ffdd00', radius: 21, bindings: 0, flash: 0, occ: null, t: 0}
+];
+
+// ===== МОДУЛЬ ДИАГНОСТИКИ v9.0-STEP1 (флаг DIAG.contacts) =====
+// Аддитивная статистика: для каждого рецептора отдельно считаем КОНТАКТЫ
+// (попадание молекулы в радиус за кадр) и УСПЕШНЫЕ СВЯЗЫВАНИЯ за сессию.
+// Цель: объяснить, почему 1A даёт ~8% связываний при eff-aff 0.63 против
+// 0.585 у 2A. НЕ влияет на динамику — только инкременты счётчиков.
+const DIAG = { contacts: true };
+for (let r of postRecs) { r.diagContacts = 0; r.diagBindOk = 0; }
+// отдельный массив: контакты по «зонам» щели относительно точки выброса DOCK x=520
+const diagZones = { nearDock: 0, farDock: 0 };   // |x-520| < 60 / иначе
+
+const SYN = {trp: [220, 60], branch: [250, 100], htp: [360, 160], ht: [400, 200]};
+const KYN_PATH = {tdo: [140, 130], kyn: [140, 180], kyna: [80, 190], quin: [170, 210]};
+const MAO_POS = {x: 770, y: 150, pulse: 0};
+const CA_SPAWN = {x: 260, y: yMem(260) - 15};
+
+const mouse = {x: -100, y: -100};
+cv.addEventListener('mousemove', e => { const r = cv.getBoundingClientRect(); mouse.x = e.clientX - r.left; mouse.y = e.clientY - r.top; });
+cv.addEventListener('mouseleave', () => { mouse.x = -100; mouse.y = -100; });
+
+const tooltips = [
+    {x: 380, y: CLEFT_TOP + 5, r: 30, title: 'SERT (периактивно)', lines: ['Захват детерминированный,', 'если транспортер не занят препаратом.', 'Блокада 92% → клиренс 8%.']},
+    {x: 660, y: CLEFT_TOP + 5, r: 30, title: 'SERT (периактивно)', lines: ['Жёлтый ромб + крест = молекула СИОЗС.', 'Такой SERT не захватывает 5-HT.']},
+    {x: 770, y: 150, r: 32, title: 'MAO', lines: ['Буферизирует ИЗБЫТОК цитозоля.', 'При блокаде SERT субстрата мало:', '5-HIAA падает (маркер блокады).']},
+    {x: REV_CENTER.x, y: REV_CENTER.y, r: 85, title: 'РЕВОЛЬВЕР ВЕЗИКУЛ', lines: ['Барабан из 3 пулов.', 'Упаковка в наименее заполненный.']},
+    {x: DOCK.x, y: DOCK.y, r: 30, title: 'Активная зона', lines: ['Слияние везикулы с мембраной.', 'Триггер — вход Ca2+.']},
+    {x: 710, y: CLEFT_TOP, r: 28, title: 'Ауторецептор 5-HT1A', lines: ['Датчик избытка, тормозит выброс.', 'Ф2/Ф3: десенситизирован →', 'торможение снято.']},
+    {x: 420, y: CLEFT_BOT - 5, r: 30, title: '5-HT1A (Gi)', lines: ['Ф3: апрегуляция x1.5.', 'Терапевтический баланс.']},
+    {x: 540, y: CLEFT_BOT - 5, r: 30, title: '5-HT2A (Gq)', lines: ['Ф3: даунрегуляция x0.55.', 'Побочки и тревога стихают.']},
+    {x: 620, y: CLEFT_BOT - 5, r: 30, title: '5-HT3 (канал)', lines: ['Пороговый. Ф3: x0.7.']},
+    {x: 140, y: 130, r: 26, title: 'TDO / IDO', lines: ['Включается с задержкой ~12с.']},
+    {x: 360, y: 160, r: 26, title: 'Tph2', lines: ['Лимитирующая стадия синтеза.']},
+    {x: 380, y: 55, r: 26, title: 'VMAT', lines: ['Упаковывает 5-HT в везикулы.']}
+];
+
+class Mol {
+    constructor(x, y, state) {
+        this.x = x; this.y = y; this.state = state;
+        this.vx = 0; this.vy = 0;
+        this.t = 0; this.target = null; this.life = 0;
+        this.recycled = false; this.degradation = false; this.trail = [];
+        this.everBound = false;
+    }
+}
+
+function gaussRandom() {
+    let u = 0, v = 0;
+    while (u === 0) u = Math.random();
+    while (v === 0) v = Math.random();
+    return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+}
+let synTimer = 0, caTimer = 0, cortTimer = 0;
+function spawnTrp() { molecules.push(new Mol(SYN.trp[0], SYN.trp[1], 'trp')); ringAdd('syn'); }
+
+function insidePre(x, y, margin) {
+    const dx = (x - PRE_CX) / (PRE_RX - margin), dy = (y - PRE_CY) / (PRE_RY - margin);
+    return dx * dx + dy * dy < 1;
+}
+function dist(x1, y1, x2, y2) { return Math.hypot(x1 - x2, y1 - y2); }
+function moveToward(m, tx, ty, sp, dt) {
+    const d = dist(m.x, m.y, tx, ty);
+    if (d > 0.1) { m.x += (tx - m.x) / d * sp * dt; m.y += (ty - m.y) / d * sp * dt; }
+}
+function wander(m, dt, sp) {
+    m.vx += (Math.random() - 0.5) * sp * 6 * dt;
+    m.vy += (Math.random() - 0.5) * sp * 6 * dt;
+    const v = Math.hypot(m.vx, m.vy);
+    if (v > sp) { m.vx = m.vx / v * sp; m.vy = m.vy / v * sp; }
+    m.x += m.vx * dt; m.y += m.vy * dt;
+}
+
+function barrelPos(i, displayRot) {
+    const angleDeg = SLOT_ANGLES[i] + displayRot * 120;
+    const rad = angleDeg * Math.PI / 180;
+    return { x: REV_CENTER.x + REV_RADIUS * Math.cos(rad), y: REV_CENTER.y + REV_RADIUS * Math.sin(rad) };
+}
+function activeVesicleIdx(rotation) { return (3 - (rotation % 3)) % 3; }
+function vesicleVisualPos(i) {
+    const v = vesicles[i];
+    if (v.state === 'barrel') return barrelPos(i, revolverDisplay);
+    return {x: v.x, y: v.y};
+}
+
+// Правка 12: переключатель режимов удалён — базовое состояние = хрон. тревога.
+
+document.querySelectorAll('#therapyBar button').forEach(b => {
+    b.addEventListener('click', () => {
+        targetPhase = parseInt(b.dataset.ph);
+        document.querySelectorAll('#therapyBar button').forEach(x => x.classList.remove('active'));
+        b.classList.add('active');
+        // при смене фазы начинаем новый замер: чистим накопленное окно и журнал
+        logAcc = {n:0, sumN:0};
+        logTimer = 0;
+        testLog.length = 0;
+        // сброс регулятора: иначе интеграл/EMA «помнят» прошлую фазу и
+        // первые секунды новой фазы дают переходный выброс/провал уровня
+        occInteg = 0;
+        occEma = null;
+        relPending = 0;
+        renderTestReport();
+    });
+});
+
+// Кнопки тестовой панели
+{
+    const ta = document.getElementById('testReport');
+    document.getElementById('btnReport').addEventListener('click', () => {
+        ta.style.display = (ta.style.display === 'none') ? 'block' : 'none';
+        renderTestReport();
+    });
+    document.getElementById('btnCopyLog').addEventListener('click', (e) => {
+        renderTestReport();
+        ta.style.display = 'block';
+        ta.select();
+        let ok = false;
+        try { ok = document.execCommand('copy'); } catch(err) {}
+        if (navigator.clipboard) navigator.clipboard.writeText(ta.value).catch(()=>{});
+        e.target.textContent = ok || navigator.clipboard ? '✔ Скопировано — вставляй сюда (Ctrl+V)' : 'Выдели и Ctrl+C';
+        setTimeout(() => { e.target.textContent = '⧉ Копировать всё'; }, 2500);
+    });
+    document.getElementById('btnClearLog').addEventListener('click', () => {
+        testLog.length = 0;
+        logAcc = {n:0, sumN:0};
+        logTimer = 0;
+        renderTestReport();
+    });
+}
+
+// Правка 4 + 12: целевые коридоры занятости щели (число молекул, 1 мол ≈ 2 нМ).
+// НОВАЯ ЛОГИКА: базовое состояние = ХРОНИЧЕСКАЯ ТРЕВОГА (дисбаланс), поэтому
+// контрольный коридор — низкий и широкий (не «гомеостаз», а неустойчивый уровень).
+// Ф1–Ф3 (лечение СИОЗС/Феварин) — восстановление к верхнему физиологическому
+// диапазону. Коридор выбран по прежним калибровкам стресс-режима.
+const FIXED_TARGETS = [
+    [6, 17],     // КОНТРОЛЬ: хрон. тревога — нестабильно, низко/короткие пики
+    [17, 28],    // Ф1 острая блокада SERT
+    [20, 28],    // Ф2 десенситизация ауторецепторов
+    [20, 28]     // Ф3 постадаптация — терапевтический баланс
+];
+// Сдвиг целевого центра по фазе (антистатическая подстройка ПИ-регулятора):
+// при block=92% (Ф1–Ф3) «топливо» для выброса ограничено и удержание нижней
+// половины коридора физически недостижимо — цель ставится на верхнюю половину.
+// Величины получены автоподбором по броуновской реплике (усреднение по сидам).
+const PHASE_BIAS = [0, +3, 0, +2];   // F3: смещён вверх — при 92% блоке SERT
+                                      // нижняя половина коридора физически
+                                      // недостижима (по автоподбору реплики)
+// Правка 4d: вторая ручка контура — вероятность слияния (release probability),
+// управляется ОТДЕЛЬНЫМ ПИ-регулятором по той же EMA-ошибке занятости щели.
+// (Раньше обе ручки множились на один occGain — при провале уровня они тянули
+// друг друга вниз и система запутывалась.) База — физиологическая p(fusion)
+// из экспериментов Бекерса/Мурата; регулятор работает вокруг неё ±.
+const RELPROB_BASE = [0.75, 0.85, 0.9, 0.9];   // базовая p(fusion) по фазам
+let relProb = RELPROB_BASE[0];                  // текущая вероятность слияния (обновляется каждый кадр)
+let relInteg = 0;                               // интеграл второго контура
+function normRange(){
+    return FIXED_TARGETS[targetPhase];
+}
+function targetCenter(){
+    const r = normRange();
+    const c = 0.5*(r[0]+r[1]) + (PHASE_BIAS[targetPhase] || 0);
+    return Math.max(r[0], Math.min(r[1], c));   // центр не выходит за коридор
+}
+
+// Правка 4c: ПИ-регулятор выброса работает по ОТСРОЧЕННОЙ скользящей средней
+// (EMA) занятости щели. Раньше он реагировал на мгновенное число молекул — из-за
+// запаздывания контура (эффект выброса приходит через ~10 c) возникали
+// автоколебания («пила» 15.8→24.9 в F3). Теперь ошибка считается от EMA со
+// «стабилизационным окном» tauAU — система гасится так, будто запаздывания нет
+// (аналог Smith-predictor). Проверено броуновской репликой: размах средних по
+// 10-с окнам сократился с ~9 до ~6 молекул, F1–F3 держат коридор во всех сидах.
+let occInteg = 0;
+let occEma = null;               // инициализируется первым замером
+// правка 5: «память» регулятора о недавнем выбросе (суммарный приток молекул
+// в щель за последнее окно оборота tauAU). Без неё контур путает запаздывание
+// системы с собственной неэффективностью: после удачного выброса уровень ещё
+// низкий (молекулы в пути/на связывании), ошибка остаётся отрицательной,
+// интеграл уползает в минимум — и следующий квант срывается. Теперь pending
+// прибавляется к EMA при расчёте ошибки — регулятор видит будущий уровень
+// и перестаёт тормозить сам себя.
+// правка 7: relPending экспоненциально «испаряется» с тем же временем tauAU,
+// что и EMA. Линейная память давала перелёты (выброс засчитывался дважды:
+// как pending и как выросший EMA) — пила 4→26 в F1. Затухающий вклад даёт
+// корректный Smith-predictor без двойного учёта.
+let relPending = 0;              // выброшено, но ещё не «доехало» в щель
+function cleftCount(){
+    let n = 0;
+    for (let m of molecules) if (m.state === 'cleft') n++;
+    return n;
+}
+function occController(dt, prm){
+    const n = cleftCount();
+    if (occEma === null) occEma = n;
+    const tauAU = 10;            // характерное время оборота молекул в щели, c
+    occEma += (n - occEma) * Math.min(1, dt / tauAU);
+    // затухание «доезжающего» притока (см. правку 7):
+    relPending *= Math.max(0, 1 - dt / tauAU);
+    const tgt = targetCenter();
+    const err = (occEma + relPending) - tgt;   // ошибка по сглаженному уровню + pipeline
+    occInteg += err * dt;
+    // правка 7b: anti-windup — интеграл не копит ошибку, когда ручка упёрлась
+    // в насыщение регулятора (иначе после долгого провала нужен целый цикл
+    // «разворота», что и давало медленные автоколебания уровня).
+// правка 9: усиление интегральной части (0.10 -> 0.25). Диагностика реального
+// кода показала: при блокаде SERT 92% и редких Ca-событиях «топливо» в щель
+// поступает квантами по 4 молекулы; слабый I-член не успевал поднять частоту
+// событий между окнами оборота, и F1/F3 стабильно недобирали до коридора
+// (средн. 8.9 / 20.8 при цели 19-28). С I=0.25 статика снимается за ~1 цикл.
+    const raw = 1 + 0.35 * err + 0.25 * occInteg;
+    if (raw > 3.0 && occInteg > 0 || raw < 0.25 && occInteg < 0) {
+        occInteg -= err * dt;    // откатить накопление на этом шаге
+    }
+    occInteg = Math.max(-3, Math.min(3, occInteg));
+    const out = raw;             // P + I
+    return Math.max(0.25, Math.min(3.0, out));
+}
+
+// ===== ТЕСТОВЫЙ ЖУРНАЛ (для снятия контрольных значений текстом) =====
+// Каждые 10 с записывает усреднённые показатели фазы в массив testLog и
+// обновляет <textarea>, который можно выделить целиком и скопировать (Ctrl+C).
+const testLog = [];
+let logAcc = {n:0, sumN:0};
+let logTimer = 0;
+function logSnapshot(dt){
+    logTimer += dt;
+    logAcc.n++;
+    logAcc.sumN += cleftCount();
+    if (logTimer < 10) return;
+    const range = normRange();
+    const mean = logAcc.sumN / logAcc.n;
+    const ok = mean >= range[0] && mean <= range[1];
+    testLog.push({
+        t: simTime.toFixed(0), phase: targetPhase, stress: getStress().toFixed(2),
+        mean: mean.toFixed(1), lo: range[0], hi: range[1],
+        relHz: (ringSum('rel') / 10).toFixed(2),   // молекул/с за последние 10 с
+        upHz: (ringSum('up') / 10).toFixed(2),
+        ok: ok
+    });
+    if (testLog.length > 60) testLog.shift();
+    renderTestReport();
+    logAcc = {n:0, sumN:0};
+    logTimer = 0;
+}
+function renderTestReport(){
+    const ta = document.getElementById('testReport');
+    if (!ta || ta.style.display === 'none') return;
+    const lines = testLog.map(r =>
+        r.ok ? '[OK]  ' : '[МИМО] '
+    ).map((tag, i) => {
+        const r = testLog[i];
+        return tag + 't=' + r.t + 'с фаза=F' + r.phase + ' стресс=' + r.stress +
+            ' | средн.щель=' + r.mean + ' (цель ' + r.lo + '-' + r.hi + ')' +
+            ' | выброс=' + r.relHz + '/с захватSERT=' + r.upHz + '/с';
+    });
+    const last5 = testLog.slice(-5);
+    const passed = last5.filter(r => r.ok).length;
+    lines.push('--------------------------------------------');
+    lines.push('ВЕРДИКТ: ' + passed + '/5 последних окон в норме' +
+        (last5.length === 5 && passed === 5 ? ' → ФАЗА СТАБИЛЬНА ✔' : ''));
+    // v9.0-step1: ДИАГНОСТИКА рецепторных контактов/связываний (в сессионных итогах)
+    if (DIAG.contacts) {
+        lines.push('--- ДИАГНОСТИКА РЕЦЕПТОРОВ (сессия) ---');
+        for (let r of postRecs) {
+            const conv = r.diagContacts ? (r.diagBindOk / r.diagContacts * 100).toFixed(2) : '0';
+            lines.push(r.type + ': контакты=' + r.diagContacts + ' связываний=' + r.diagBindOk +
+                ' конверсия=' + conv + '% eff-aff=' + (r.aff * (r.type.startsWith('5-HT1A') ? P().ht1a : r.type.startsWith('5-HT2A') ? P().ht2a : P().ht3)).toFixed(3));
+        }
+        const zt = diagZones.nearDock + diagZones.farDock;
+        lines.push('Зоны контактов: у DOCK(|x-520|<60)=' + diagZones.nearDock +
+            ' (' + (zt ? (diagZones.nearDock / zt * 100).toFixed(1) : 0) + '%)' +
+            ' дальше=' + diagZones.farDock);
+    }
+    ta.value = lines.join('\n');
+}
+
+// ===== МОДУЛЬ v9.1: tph2_exhaustion (флаг) =====
+// Хроническая активация миндалевидного тела истощает 5-HT-нейроны: Tph2
+// (лимитирующая стадия синтеза) даётся ингибиторно через 5-HT1A-авторецепцию
+// и кортизол. В модели: если stress > 0.5 непрерывно дольше 120 с, множитель
+// synth *= (1 - 0.35*exhaustion), exhaustion растёт линейно к 1 за 180 с.
+// Флаг выключен => поведение идентично предыдущей версии. Активен только в
+// хронике (F0); при снижении стресса (Ф3 постадаптация) истощение медленно
+// восстанавливается (x2 медленнее).
+const MODULES = { tph2_exhaustion: true, smooth_history: true };
+let exhTimer = 0;        // сколько секунд подряд stress > 0.5
+let exhaustion = 0;      // 0..1
+
+// helper: вызывается ОДНОЙ строкой сразу после const prm = P() в update().
+// Вход/выход явные: мутирует только prm.synth, динамику больше не трогает.
+function applyTph2Exhaustion(prm, dt, stressLevel) {
+    if (!MODULES.tph2_exhaustion) return prm;
+    if (stressLevel > 0.5) {
+        exhTimer += dt;
+        if (exhTimer > 120) exhaustion = Math.min(1, exhaustion + dt / 180);
+    } else {
+        exhTimer = Math.max(0, exhTimer - dt * 2);   // восстановление вдвое медленнее накопления
+        if (exhTimer <= 120) exhaustion = Math.max(0, exhaustion - dt / 360);
+    }
+    prm.synth *= (1 - 0.35 * exhaustion);
+    return prm;
+}
+
+// ===== МОДУЛЬ v9.2: smooth_history (флаг) =====
+// Линию «выброс» на графике ИСТОРИЯ рисовать скользящим средним за 3 с.
+// Сырые секундные суммы (histRel) остаются в данных нетронутыми — сглаживается
+// только отображение, чтобы убрать прямоугольную «пилу» квантовых выбросов.
+function smoothSeries(arr, winSec) {
+    const out = [];
+    for (let i = 0; i < arr.length; i++) {
+        let s = 0, c = 0;
+        for (let j = Math.max(0, i - winSec + 1); j <= i; j++) { s += arr[j]; c++; }
+        out.push(s / c);
+    }
+    return out;
+}
+
+function update(dt) {
+    time += dt;
+    simTime += dt;
+    logSnapshot(dt);
+    const tgt = THERAPY_PHASES[targetPhase];
+    for (let k of ['block','desens','adapt']) {
+        const d = tgt[k] - therapy[k];
+        const step = dt / 5;
+        therapy[k] += Math.abs(d) < step ? d : Math.sign(d) * step;
+    }
+
+    const prm = P();
+
+    // Правка 12: стресс больше не «переключается» пользователем — базовый уровень
+    // хронической тревоги (0.85) плавно снижается терапией через therapy.adapt
+    // (см. getStress()). tdoRamp остаётся активной, т.к. стресс > 0.5 всегда.
+    const stressLevel = getStress();
+    applyTph2Exhaustion(prm, dt, stressLevel);   // v9.1 tph2_exhaustion (одна строка-хелпер)
+
+    if (stressLevel > 0.5) tdoRamp = Math.min(1, tdoRamp + dt / 12);
+    else tdoRamp = Math.max(0, tdoRamp - dt / 5);
+    const tdoEff = prm.tdo * tdoRamp;
+
+    ringTick(dt);
+
+    // Правка 11: непрерывная стохастическая блокада SERT.
+    // Раньше статус blocked перебрасывался ОДИН монетный бросок раз в 10 с для
+    // обоих транспортеров сразу: при block=0.92 это давало режим «взрыв-затишье»
+    // (~92% времени щель не чистится вовсе, 8% — чистится обоими SERT яростно).
+    // ПИ-регулятор за окном оборота tauAU=10 с не успевал компенсировать такую
+    // медленную модуляцию — отсюда дрейф и пила в F1–F3 (23.5→8.9 за фазу).
+    // Теперь каждый SERT независимо пере-bерётся каждый кадр с вероятностью
+    // block: клиренс становится непрерывным процессом со средним темпом
+    // block*rate_free — физически корректная картина конкурентного ингибирования
+    // СИОЗС (молекулы препарата динамически занимают/покидают сайт транспорта).
+    for (let s of serts) s.blocked = Math.random() < therapy.block;
+
+    let cytosolCount = 0;
+    for (let m of molecules) if (m.state === 'cytosol') cytosolCount++;
+
+    synTimer += dt;
+    if (synTimer > 0.5 / prm.synth) { synTimer = 0; spawnTrp(); }
+
+    const caActive = calciumEvents.some(e => e.active && e.t < e.duration);
+    // правка 4c/4d/5: ПИ-коррекция частоты Ca2+-событий и p(fusion) по ошибке
+    // занятости щели (ошибка считается с учётом «доезжающих» выбросов).
+    const occGain = occController(dt, prm);
+    // правка 5a: relProb ограничена снизу физиологическим минимумом 0.6
+    // (базальная вероятность слияния в активной зоне), сверху — 1.0.
+    // правка 8: перенос «топливной» части регулятора на частоту Ca2+-событий.
+    // Ручка relProb оставлена почти постоянной (узкий коридор 0.75–1.0):
+    // при сильной модуляции обеих ручек контур получал суммарный коэффициент
+    // err² и входил в медленные автоколебания (провалы F0/F1 до 3–5 молекул).
+    relProb = Math.max(0.75, Math.min(1.0, RELPROB_BASE[targetPhase] * (0.9 + 0.1 * occGain)));
+    caTimer += dt;
+    if (!caActive && caTimer > prm.caInterval * (0.8 + Math.random() * 0.4) / occGain) {
+        caTimer = 0;
+        calciumEvents.push({ x: CA_SPAWN.x + (Math.random() - 0.5) * 40, y: CA_SPAWN.y + (Math.random() - 0.5) * 8, t: 0, duration: 0.6, active: true });
+    }
+
+    cortTimer += dt;
+    if (cortTimer > (3.0 - 2.2 * stressLevel)) {
+        cortTimer = 0;
+        if (stressLevel > 0.15) {
+            cortisolMols.push({ x: CLEFT_LEFT + 20 + Math.random() * (CLEFT.w - 40), y: CLEFT_TOP + 20 + Math.random() * (CLEFT.h - 40), vx: 0, vy: 0, life: 0, phase: 'outside' });
+        }
+    }
+    for (let c of cortisolMols) {
+        c.life += dt;
+        if (c.phase === 'outside') {
+            wander(c, dt, 20);
+            c.y -= 70 * dt;
+            if (c.y > CLEFT_BOT - 6) c.y = CLEFT_BOT - 6;
+            if (c.x < CLEFT_LEFT + 6) c.x = CLEFT_LEFT + 6;
+            if (c.x > CLEFT_RIGHT - 6) c.x = CLEFT_RIGHT - 6;
+            if (c.y < CLEFT_TOP + 6) { c.phase = 'crossing'; c.t = 0; }
+        } else if (c.phase === 'crossing') {
+            c.t += dt;
+            c.y = CLEFT_TOP + 5 - c.t * 30;
+            if (c.t > 0.5) { c.phase = 'inside'; c.t = 0; }
+        } else if (c.phase === 'inside') {
+            wander(c, dt, 25);
+            if (!insidePre(c.x, c.y, 30)) { c.x += (PRE_CX - c.x) * 0.05; c.y += (PRE_CY - c.y) * 0.05; }
+        }
+    }
+    cortisolMols = cortisolMols.filter(c => c.life < 8);
+
+    const rotating = Math.abs(revolverDisplay - revolverRotation) > 0.01;
+    if (rotating) {
+        const fullCount = vesicles.filter(v => v.count >= VES_FULL).length;
+        const rotSpeed = 2.5 + fullCount * 1.5;
+        const diff = revolverRotation - revolverDisplay;
+        revolverDisplay += Math.sign(diff) * Math.min(Math.abs(diff), rotSpeed * dt);
+    }
+    const busyIdx = vesicles.findIndex(v => v.state !== 'barrel');
+
+    for (let i = 0; i < 3; i++) {
+        const v = vesicles[i];
+        v.t += dt;
+        if (v.state === 'barrel') { const p = barrelPos(i, revolverDisplay); v.x = p.x; v.y = p.y; }
+        else if (v.state === 'docking') {
+            v.x += (DOCK.x - v.x) * 0.12; v.y += (DOCK.y - v.y) * 0.12;
+            if (dist(v.x, v.y, DOCK.x, DOCK.y) < 4) { v.state = 'fusing'; v.t = 0; }
+        }
+        else if (v.state === 'fusing') {
+            v.x = DOCK.x; v.y = DOCK.y;
+            if (v.t > 0.45) {
+                // правка 4d: вероятность квантового выброса (release probability).
+                // Неудачное слияние = везикула возвращается, не опорожняясь
+                // (физически: standby-состояние active zone, ~50% событий в контроле).
+// правка 10: физика квантового выброса. В реальном синапсе при блокаде SERT
+// везикулы успевают наполняться (VMAT не ждёт захвата — цитозольный пул
+// пополняется синтезом), и каждый Ca2+-триггер даёт полный квант ~4 молекулы.
+// Раньше при 92% блокады везикулы приходили на докинг полупустыми (count 1-2),
+// и даже редкие события давали мало «топлива» — F1/F3 недобирали до коридора,
+// а PI-регулятор выкручивал ручку в насыщение и раскачивал систему.
+// Теперь перед слиянием везикула дозаполняется из цитозольного пула:
+// сколько реально удалось упаковать — столько и уходит в щель (физично:
+// VMAT работает весь межквантовый интервал).
+                if (Math.random() < relProb) {
+                    // дозаправка везикулы из цитозоля (не больше VES_FULL)
+                    let cyto = molecules.filter(mm => mm.state === 'cytosol' && !mm.degradation);
+                    while (v.count < VES_FULL && cyto.length > 0) {
+                        const pick = cyto.pop();
+                        pick.dead = true;
+                        v.count++;
+                    }
+                    const spawnY = CLEFT_TOP + 10;
+                    for (let k = 0; k < v.count; k++) {
+                        const mm = new Mol(DOCK.x + (Math.random() - 0.5) * 40, spawnY + Math.random() * 12, 'cleft');
+                        molecules.push(mm);
+                    }
+                    ringAdd('rel'); ring.rel[ringIdx] += v.count - 1;
+                    secRelAcc += v.count;
+                    // правка 5: учёт «доезжающего» притока для регулятора
+                    relPending += v.count;
+                    v.count = 0;
+                }
+                v.state = 'returning'; v.t = 0;
+            }
+        }
+        else if (v.state === 'returning') {
+            const home = barrelPos(i, revolverDisplay);
+            v.x += (home.x - v.x) * 0.12; v.y += (home.y - v.y) * 0.12;
+            if (dist(v.x, v.y, home.x, home.y) < 4) { v.state = 'barrel'; v.t = 0; }
+        }
+    }
+
+    if (busyIdx === -1 && !rotating) {
+        const activeIdx = activeVesicleIdx(revolverRotation);
+        const activeVes = vesicles[activeIdx];
+        const delay = (autoRec.active ? 2.0 : 0.3) / activeVes.speed;
+        if (activeVes.count >= VES_FULL && activeVes.t > delay && caActive) { activeVes.state = 'docking'; activeVes.t = 0; }
+        else if (activeVes.count < VES_FULL) {
+            const otherFull = vesicles.some((v, idx) => idx !== activeIdx && v.count >= VES_FULL);
+            if (otherFull) revolverRotation = (revolverRotation + 1) % 3;
+        }
+    }
+
+    for (let m of molecules) {
+        m.t += dt; m.life += dt;
+
+        if (m.state === 'trp') {
+            moveToward(m, SYN.branch[0], SYN.branch[1], 80, dt);
+            if (dist(m.x, m.y, SYN.branch[0], SYN.branch[1]) < 8) {
+                m.state = Math.random() < tdoEff ? 'kyn' : 'htp'; m.t = 0;
+                if (m.state === 'kyn') ringAdd('kyn');
+            }
+        }
+        else if (m.state === 'htp') {
+            moveToward(m, SYN.ht[0], SYN.ht[1], 80, dt);
+            if (dist(m.x, m.y, SYN.ht[0], SYN.ht[1]) < 8) { m.state = 'cytosol'; m.t = 0; m.life = 0; }
+        }
+        else if (m.state === 'kyn') {
+            moveToward(m, KYN_PATH.kyn[0], KYN_PATH.kyn[1], 70, dt);
+            if (dist(m.x, m.y, KYN_PATH.kyn[0], KYN_PATH.kyn[1]) < 8) {
+                m.state = Math.random() < prm.kynShift ? 'quin' : 'kyna'; m.t = 0;
+                if (m.state === 'quin') ringAdd('quin'); else ringAdd('kyna');
+            }
+        }
+        else if (m.state === 'kyna') {
+            moveToward(m, KYN_PATH.kyna[0], KYN_PATH.kyna[1], 60, dt);
+            if (dist(m.x, m.y, KYN_PATH.kyna[0], KYN_PATH.kyna[1]) < 8) { m.dead = true; }
+        }
+        else if (m.state === 'quin') {
+            moveToward(m, KYN_PATH.quin[0], KYN_PATH.quin[1], 60, dt);
+            if (dist(m.x, m.y, KYN_PATH.quin[0], KYN_PATH.quin[1]) < 8) { m.dead = true; }
+        }
+        else if (m.state === 'cytosol') {
+            wander(m, dt, 130);
+            // правка 6: мягкие стенки пресинаптического терминаля.
+            // Эллипс (PRE_CX,PRE_CY,PRE_RX,PRE_RY) — физическая граница нейрита:
+            // раньше молекула «прилипала» к стенке и дёргалась рывками внутрь.
+            // Теперь скорость раскладывается на нормаль/касательную к эллипсу:
+            // нормальная компонента отражается плавно (пружина + демпфирование),
+            // касательная сохраняется — молекула скользит вдоль мембраны, как
+            // броуновская частица у стенки (отражение в противоположную сторону
+            // без телепортации к центру).
+            const wall = 8;                       // толщина пристенечного слоя, px
+            const ex = (m.x - PRE_CX) / PRE_RX, ey = (m.y - PRE_CY) / PRE_RY;
+            const eNorm = Math.sqrt(ex*ex + ey*ey);   // <1 внутри, =1 на стенке
+            if (eNorm > 1 - wall/Math.min(PRE_RX, PRE_RY)) {
+                // внешняя нормаль эллипса: градиент (x²/a²+y²/b²)
+                let nx = ex / PRE_RX, ny = ey / PRE_RY;
+                const nl = Math.hypot(nx, ny) || 1; nx /= nl; ny /= nl;
+                if (eNorm > 1) {                  // вышла за стенку — вернуть на границу
+                    m.x = PRE_CX + ex / eNorm * PRE_RX;
+                    m.y = PRE_CY + ey / eNorm * PRE_RY;
+                }
+                const vn = m.vx * nx + m.vy * ny; // нормальная компонента скорости
+                if (vn > 0) {                     // движется к стенке — отражаем
+                    m.vx -= 2 * vn * nx;          // зеркальное отражение
+                    m.vy -= 2 * vn * ny;
+                    m.vx *= 0.85; m.vy *= 0.85;   // лёгкое демпфирование (упругость мембраны)
+                }
+                // упругий отпор от стенки (закон Гука в пристенечном слое)
+                const push = 40 * Math.max(0, eNorm - (1 - wall/Math.min(PRE_RX, PRE_RY))) / (wall/Math.min(PRE_RX, PRE_RY));
+                m.vx -= nx * push * dt * 10;
+                m.vy -= ny * push * dt * 10;
+            }
+            if (m.degradation && !insidePre(m.x, m.y, 10)) { m.x = PRE_CX + ex/Math.max(eNorm,1e-6)*PRE_RX*0.9; m.y = PRE_CY + ey/Math.max(eNorm,1e-6)*PRE_RY*0.9; }
+            if (!m.degradation && m.life > 2.0) {
+                const overload = Math.max(0, cytosolCount - 15);
+                const rate = (0.15 + 0.05 * overload) * prm.mao;
+                if (Math.random() < rate * dt) m.degradation = true;
+            }
+            if (m.life > 8.0) { m.dead = true; ringAdd('lost'); continue; }
+            if (m.degradation) {
+                const dx = MAO_POS.x - m.x, dy = MAO_POS.y - m.y, d = dist(m.x, m.y, MAO_POS.x, MAO_POS.y);
+                m.vx += dx / d * 500 * dt; m.vy += dy / d * 500 * dt;
+                m.trail.push({x: m.x, y: m.y}); if (m.trail.length > 12) m.trail.shift();
+                if (d < 45) { m.dead = true; ringAdd('mao'); maoTotal++; hiaaFlashes.push({x: MAO_POS.x, y: MAO_POS.y, t: 0}); MAO_POS.pulse = 1.0; }
+                continue;
+            }
+            let best = null, bc = VES_FULL + 1, bi = -1;
+            for (let i = 0; i < 3; i++) {
+                if (vesicles[i].count < VES_FULL && vesicles[i].state === 'barrel') {
+                    if (vesicles[i].count < bc) { bc = vesicles[i].count; best = vesicles[i]; bi = i; }
+                }
+            }
+            if (best) {
+                const pos = barrelPos(bi, revolverDisplay);
+                const dx = pos.x - m.x, dy = pos.y - m.y, d = dist(m.x, m.y, pos.x, pos.y) || 1;
+                // правка 6b: упаковка только в пределах досягаемости терминаля —
+                // раньше притяжение к VMAT растащивало цитозольные молекулы за
+                // стенки нейрита; теперь тянем мягко и не выносим за эллипс
+                // (стенки отражают сами, см. правку 6 выше).
+                if (insidePre(pos.x, pos.y, 30)) {
+                    m.vx += dx / d * 180 * dt; m.vy += dy / d * 180 * dt;
+                    if (d < 26) { best.count++; m.dead = true; continue; }
+                }
+            }
+        }
+        else if (m.state === 'cleft') {
+            const step = DIFFUSION_COEFF * Math.sqrt(dt);
+            m.x += gaussRandom() * step;
+            m.y += gaussRandom() * step;
+
+            if (m.y < CLEFT_TOP + 4) m.y = CLEFT_TOP + 4;
+            if (m.y > CLEFT_BOT - 4) m.y = CLEFT_BOT - 4;
+
+            if (m.x < CLEFT_LEFT || m.x > CLEFT_RIGHT) {
+                if (Math.random() < EDGE_REFLECT) {
+                    m.x = m.x < CLEFT_LEFT ? CLEFT_LEFT + 4 : CLEFT_RIGHT - 4;
+                } else { m.dead = true; ringAdd('diff'); continue; }
+            }
+
+            let captured = false;
+            for (let s of serts) {
+                if (!s.blocked && dist(m.x, m.y, s.x, s.y) < s.radius) {
+                    ringAdd('up');
+                    s.flash = 1.0;
+                    m.recycled = true;
+                    m.degradation = Math.random() < prm.maoFraction;
+                    m.state = 'cytosol'; m.t = 0; m.life = 0;
+                    m.x = s.x; m.y = s.y - 40;
+                    m.vx = (Math.random() - 0.5) * 40; m.vy = -60;
+                    captured = true;
+                    break;
+                }
+            }
+            if (captured) continue;
+
+            for (let r of postRecs) {
+                const sens = r.type.startsWith('5-HT1A') ? prm.ht1a : (r.type.startsWith('5-HT2A') ? prm.ht2a : prm.ht3);
+                if (dist(m.x, m.y, r.x, r.y) < r.radius) {
+                    // v9.0-step1: диагностика — считаем контакты и успешные связывания
+                    if (DIAG.contacts) {
+                        r.diagContacts++;
+                        if (Math.abs(m.x - DOCK.x) < 60) diagZones.nearDock++; else diagZones.farDock++;
+                    }
+                    const prob = 1 - Math.exp(-r.aff * sens * BIND_RATE * dt);
+                    if (Math.random() < prob) {
+                        r.occ = m; r.bindings++;
+                        if (DIAG.contacts) r.diagBindOk++;
+                        if (r.type.startsWith('5-HT2A')) ringAdd('ev2');
+                        if (r.type.startsWith('5-HT3')) ringAdd('ev3');
+                        if (r.type.startsWith('5-HT1A')) ringAdd('ev1');
+                        if (!m.everBound) { m.everBound = true; signaledTotal++; }
+                        m.state = 'bound'; m.target = r; m.t = 0;
+                        r.flash = 1.0;
+                        receptorFlashes.push({x: r.x, y: r.y - 10, color: r.color, t: 0});
+                        break;
+                    }
+                }
+            }
+
+            if (m.state === 'cleft' && !autoRec.occupied && dist(m.x, m.y, autoRec.x, autoRec.y + 15) < 25) {
+                // правка 2c: усилена авто-тормозная петля (AUTO_K=1.2), было *0.5
+                if (Math.random() < Math.min(1.0, prm.autoSens * 1.2)) { autoRec.occupied = m; m.state = 'auto'; m.t = 0; }
+            }
+
+            // правка 1b: буфер ёмкости щели — при превышении CLEFT_MAX_POP
+            // самые старые свободные молекулы уходят периферическую диффузией
+            // (физически: выход из активационной зоны в объём вне щели)
+        }
+        else if (m.state === 'bound') {
+            if (m.t > 0.5 + 0.5 / m.target.aff) {   // правка 13a
+                m.target.occ = null;
+                m.state = 'cleft';
+                m.t = 0;
+            }
+        }
+        else if (m.state === 'auto') {
+            if (m.t > 2.0) { autoRec.occupied = null; autoRec.active = true; autoRec.activeT = 3.0 * prm.autoSens; m.dead = true; }
+        }
+    }
+    // правка 1b (реализация): буфер ёмкости щели. Если свободных молекул больше
+    // CLEFT_MAX_POP, самые старые вытесняются периферической диффузией.
+    {
+        const frees = molecules.filter(m => m.state === 'cleft');
+        if (frees.length > CLEFT_MAX_POP) {
+            frees.sort((a, b) => a.life - b.life);
+            for (let i = 0; i < frees.length - CLEFT_MAX_POP; i++) {
+                frees[i].dead = true; ringAdd('diff');
+            }
+        }
+    }
+    molecules = molecules.filter(m => !m.dead);
+
+    for (let s of serts) { if (s.flash > 0) s.flash -= dt * 3; }
+    if (autoRec.active) {
+        autoRec.activeT -= dt; autoRec.pulse = 0.5 + 0.5 * Math.sin(time * 8);
+        if (autoRec.activeT <= 0) { autoRec.active = false; autoRec.pulse = 0; }
+    }
+    for (let f of hiaaFlashes) f.t += dt;
+    hiaaFlashes = hiaaFlashes.filter(f => f.t < 1.5);
+    for (let f of receptorFlashes) f.t += dt;
+    receptorFlashes = receptorFlashes.filter(f => f.t < 0.8);
+    for (let e of calciumEvents) e.t += dt;
+    calciumEvents = calciumEvents.filter(e => e.t < 0.8);
+    if (MAO_POS.pulse > 0) MAO_POS.pulse -= dt * 2;
+}
+
+function lerpColor(c1, c2, t) {
+    const p = h => [parseInt(h.slice(1,3),16), parseInt(h.slice(3,5),16), parseInt(h.slice(5,7),16)];
+    const a = p(c1), b = p(c2);
+    const r = a.map((v,i) => Math.round(v + (b[i]-v)*t));
+    return `rgb(${r[0]},${r[1]},${r[2]})`;
+}
+
+function draw() {
+    ctx.clearRect(0, 0, W, H);
+    const stressLevel = getStress();   // правка 12: фон отражает уровень тревоги
+    ctx.fillStyle = lerpColor('#fafaf5', '#ffe2e2', stressLevel);
+    ctx.fillRect(0, 0, W, H);
+    drawPre(); drawPostStrip();
+    drawDockZone(); drawRevolverCircle();
+    drawSynthesisPath(); drawKynPath();
+    drawVesicles(); drawMAO(); drawSERTs(); drawAutoRec(); drawPostRecs();
+    drawCalciumEvents(); drawCortisol(); drawReceptorFlashes();
+    drawMolecules(); drawHIAA(); drawLabels(); drawHistory(); drawLegend(); drawDashboard(); drawTooltip();
+}
+function drawPre() {
+    const stressLevel = getStress();
+    const grad = ctx.createRadialGradient(PRE_CX - 80, PRE_CY - 60, 40, PRE_CX, PRE_CY, PRE_RX);
+    grad.addColorStop(0, lerpColor('#fff7a0', '#ffd977', stressLevel));
+    grad.addColorStop(0.55, lerpColor('#ffe14a', '#ffb84d', stressLevel));
+    grad.addColorStop(1, lerpColor('#f2b900', '#f08c1a', stressLevel));
+    ctx.save();
+    ctx.shadowColor = 'rgba(0,0,0,0.25)'; ctx.shadowBlur = 14; ctx.shadowOffsetY = 5;
+    ctx.fillStyle = grad;
+    ctx.beginPath(); ctx.ellipse(PRE_CX, PRE_CY, PRE_RX, PRE_RY, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+    ctx.strokeStyle = '#000'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.ellipse(PRE_CX, PRE_CY, PRE_RX, PRE_RY, 0, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.moveTo(CLEFT_LEFT, CLEFT_TOP);
+    ctx.lineTo(CLEFT_RIGHT, CLEFT_TOP);
+    ctx.lineTo(CLEFT_RIGHT, yMem(CLEFT_RIGHT));
+    for (let x = CLEFT_RIGHT; x >= CLEFT_LEFT; x -= 8) ctx.lineTo(x, yMem(x));
+    ctx.closePath();
+    ctx.fill();
+    ctx.save();
+    ctx.globalAlpha = 0.35;
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath(); ctx.ellipse(PRE_CX - 120, PRE_CY - 70, 180, 45, -0.25, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+    ctx.strokeStyle = '#000'; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.moveTo(CLEFT_LEFT, CLEFT_TOP); ctx.lineTo(CLEFT_RIGHT, CLEFT_TOP); ctx.stroke();
+    ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(CLEFT_LEFT, yMem(CLEFT_LEFT)); ctx.lineTo(CLEFT_LEFT, CLEFT_TOP); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(CLEFT_RIGHT, yMem(CLEFT_RIGHT)); ctx.lineTo(CLEFT_RIGHT, CLEFT_TOP); ctx.stroke();
+}
+function drawPostStrip() {
+    const stressLevel = getStress();
+    const x0 = CLEFT_LEFT, y0 = CLEFT_BOT, w = CLEFT.w, h = 70, r = 16;
+    ctx.save();
+    ctx.shadowColor = 'rgba(0,0,0,0.25)'; ctx.shadowBlur = 14; ctx.shadowOffsetY = 5;
+    const g = ctx.createLinearGradient(0, y0, 0, y0 + h);
+    g.addColorStop(0, lerpColor('#6db35c', '#b0766a', stressLevel));
+    g.addColorStop(0.25, lerpColor('#8fca7f', '#c98f7f', stressLevel));
+    g.addColorStop(1, lerpColor('#b9e3ab', '#e0b3a5', stressLevel));
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.moveTo(x0, y0);
+    ctx.lineTo(x0 + w, y0);
+    ctx.lineTo(x0 + w, y0 + h - r);
+    ctx.quadraticCurveTo(x0 + w, y0 + h, x0 + w - r, y0 + h);
+    ctx.lineTo(x0 + r, y0 + h);
+    ctx.quadraticCurveTo(x0, y0 + h, x0, y0 + h - r);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+    ctx.strokeStyle = '#000'; ctx.lineWidth = 3;
+    ctx.stroke();
+    ctx.strokeStyle = '#000'; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x0 + w, y0); ctx.stroke();
+    ctx.strokeStyle = 'rgba(255,255,255,0.35)'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(x0 + 6, y0 + 7); ctx.lineTo(x0 + w - 6, y0 + 7); ctx.stroke();
+    ctx.fillStyle = '#2d4a26'; ctx.font = '11px Courier New'; ctx.textAlign = 'center';
+    ctx.fillText('ПОСТСИНАПТИЧЕСКИЙ НЕЙРОН', x0 + w / 2, y0 + 62);
+    ctx.textAlign = 'left';
+}
+function drawDockZone() {
+    ctx.strokeStyle = 'rgba(255,170,0,0.35)'; ctx.lineWidth = 2; ctx.setLineDash([5, 4]);
+    ctx.beginPath(); ctx.arc(DOCK.x, DOCK.y, 34, 0, Math.PI * 2); ctx.stroke(); ctx.setLineDash([]);
+}
+function drawRevolverCircle() {
+    ctx.strokeStyle = 'rgba(100,100,100,0.25)'; ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.arc(REV_CENTER.x, REV_CENTER.y, REV_RADIUS, 0, Math.PI * 2); ctx.stroke(); ctx.setLineDash([]);
+}
+function drawSynthesisPath() {
+    ctx.strokeStyle = '#664400'; ctx.lineWidth = 2; ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    ctx.moveTo(SYN.trp[0], SYN.trp[1]); ctx.lineTo(SYN.branch[0], SYN.branch[1]);
+    ctx.lineTo(SYN.htp[0], SYN.htp[1]); ctx.lineTo(SYN.ht[0], SYN.ht[1]);
+    ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = '#664400'; ctx.font = '11px Courier New';
+    ctx.fillText('Trp', SYN.trp[0] - 8, SYN.trp[1] - 6);
+    ctx.fillText('Tph2', SYN.htp[0] - 45, SYN.htp[1] - 8);
+    ctx.fillText('5-HTP', SYN.htp[0] + 10, SYN.htp[1] - 4);
+    ctx.fillText('AAAD', SYN.ht[0] - 45, SYN.ht[1] - 6);
+    ctx.fillText('5-HT', SYN.ht[0] + 10, SYN.ht[1] + 4);
+}
+function drawKynPath() {
+    ctx.strokeStyle = '#7744cc'; ctx.lineWidth = 2; ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    ctx.moveTo(SYN.branch[0], SYN.branch[1]); ctx.lineTo(KYN_PATH.kyn[0], KYN_PATH.kyn[1]);
+    ctx.moveTo(KYN_PATH.kyn[0], KYN_PATH.kyn[1]); ctx.lineTo(KYN_PATH.kyna[0], KYN_PATH.kyna[1]);
+    ctx.moveTo(KYN_PATH.kyn[0], KYN_PATH.kyn[1]); ctx.lineTo(KYN_PATH.quin[0], KYN_PATH.quin[1]);
+    ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = '#7744cc'; ctx.font = '10px Courier New';
+    ctx.fillText('TDO', KYN_PATH.tdo[0] - 35, KYN_PATH.tdo[1]);
+    ctx.fillText('KYN', KYN_PATH.kyn[0] + 8, KYN_PATH.kyn[1]);
+    ctx.fillStyle = C_KYNA; ctx.fillText('KYNA', KYN_PATH.kyna[0] - 10, KYN_PATH.kyna[1] + 15);
+    ctx.fillStyle = C_QUIN; ctx.fillText('QUIN', KYN_PATH.quin[0] + 8, KYN_PATH.quin[1] + 8);
+}
+function drawVesicles() {
+    for (let i = 0; i < 3; i++) {
+        const v = vesicles[i]; const pos = vesicleVisualPos(i);
+        const isFusing = (v.state === 'fusing'); const isDocking = (v.state === 'docking');
+        ctx.fillStyle = 'rgba(0,0,0,0.2)';
+        ctx.beginPath(); ctx.ellipse(pos.x + 3, pos.y + 3, 26, 26, 0, 0, Math.PI * 2); ctx.fill();
+        const size = 26 + (isFusing ? 8 : 0);
+        const vg = ctx.createRadialGradient(pos.x - 8, pos.y - 8, 4, pos.x, pos.y, size);
+        vg.addColorStop(0, '#ffffff'); vg.addColorStop(1, '#e8e8e8');
+        ctx.fillStyle = vg; ctx.strokeStyle = '#000'; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(pos.x, pos.y, size, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+        if (isFusing) {
+            const pulse = 0.5 + 0.5 * Math.sin(v.t * Math.PI / 0.45);
+            ctx.strokeStyle = `rgba(255,170,0,${0.5 + pulse * 0.5})`; ctx.lineWidth = 3;
+            ctx.beginPath(); ctx.arc(pos.x, pos.y, size + 5 + pulse * 5, 0, Math.PI * 2); ctx.stroke();
+        }
+        if (isDocking) { ctx.strokeStyle = '#88aaff'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(pos.x, pos.y, size + 4, 0, Math.PI * 2); ctx.stroke(); }
+        ctx.fillStyle = C_5HT;
+        for (let j = 0; j < v.count; j++) {
+            const a = j / VES_FULL * Math.PI * 2;
+            ctx.beginPath(); ctx.arc(pos.x + Math.cos(a) * 12, pos.y + Math.sin(a) * 12, 3.5, 0, Math.PI * 2); ctx.fill();
+        }
+        ctx.fillStyle = POOL_COLORS[v.pool]; ctx.font = 'bold 10px Courier New';
+        ctx.fillText(v.pool, pos.x - 12, pos.y + 40);
+    }
+}
+function drawMAO() {
+    const size = 20 + MAO_POS.pulse * 10;
+    if (MAO_POS.pulse > 0) { ctx.fillStyle = 'rgba(255,100,100,' + MAO_POS.pulse * 0.5 + ')'; ctx.beginPath(); ctx.arc(MAO_POS.x, MAO_POS.y, size + 12, 0, Math.PI * 2); ctx.fill(); }
+    ctx.fillStyle = C_MAO;
+    ctx.beginPath(); ctx.arc(MAO_POS.x, MAO_POS.y, size, 0.3, Math.PI * 2 - 0.3); ctx.lineTo(MAO_POS.x, MAO_POS.y); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = '#000'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#000'; ctx.font = 'bold 11px Courier New';
+    ctx.fillText('MAO', MAO_POS.x - 15, MAO_POS.y + 38);
+    ctx.font = '10px Courier New'; ctx.fillText('5-HT→5-HIAA', MAO_POS.x - 30, MAO_POS.y + 50);
+}
+function drawSERTs() {
+    for (let s of serts) {
+        const size = 15 + Math.max(0, s.flash) * 8;
+        if (s.flash > 0) { ctx.fillStyle = 'rgba(100,170,255,' + Math.max(0,s.flash) * 0.5 + ')'; ctx.beginPath(); ctx.arc(s.x, s.y, size + 10, 0, Math.PI * 2); ctx.fill(); }
+        const sg = ctx.createRadialGradient(s.x - 5, s.y - 5, 2, s.x, s.y, size);
+        sg.addColorStop(0, '#5b9be6'); sg.addColorStop(1, '#1b4f9c');
+        ctx.fillStyle = sg; ctx.strokeStyle = '#000'; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(s.x, s.y, size, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+        ctx.fillStyle = '#fff'; ctx.font = '8px Courier New'; ctx.textAlign = 'center';
+        ctx.fillText('SERT', s.x, s.y + 3); ctx.textAlign = 'left';
+        ctx.strokeStyle = 'rgba(34,102,204,0.2)'; ctx.lineWidth = 1; ctx.setLineDash([3,3]);
+        ctx.beginPath(); ctx.arc(s.x, s.y, s.radius, 0, Math.PI * 2); ctx.stroke(); ctx.setLineDash([]);
+        if (s.blocked) {
+            ctx.fillStyle = C_SSRI; ctx.strokeStyle = '#997700'; ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            ctx.moveTo(s.x, s.y - size - 10); ctx.lineTo(s.x + 7, s.y - size - 3);
+            ctx.lineTo(s.x, s.y - size + 4); ctx.lineTo(s.x - 7, s.y - size - 3);
+            ctx.closePath(); ctx.fill(); ctx.stroke();
+            ctx.strokeStyle = '#cc3333'; ctx.lineWidth = 2;
+            ctx.beginPath(); ctx.moveTo(s.x - size, s.y - size); ctx.lineTo(s.x + size, s.y + size); ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(s.x + size, s.y - size); ctx.lineTo(s.x - size, s.y + size); ctx.stroke();
+        }
+    }
+}
+function drawAutoRec() {
+    const desens = therapy.desens > 0.5;
+    ctx.fillStyle = desens ? '#7a9a8a' : (autoRec.active ? '#006633' : C_AUTO);
+    ctx.strokeStyle = '#000'; ctx.lineWidth = 2;
+    ctx.fillRect(autoRec.x - 12, autoRec.y - 14, 24, 26); ctx.strokeRect(autoRec.x - 12, autoRec.y - 14, 24, 26);
+    if (autoRec.active) { ctx.strokeStyle = '#00ff88'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(autoRec.x, autoRec.y, 30, 0, Math.PI * 2); ctx.stroke(); }
+    ctx.fillStyle = '#006633'; ctx.font = 'bold 10px Courier New';
+    ctx.fillText(desens ? '1A-авто (десенс)' : '1A-авто', autoRec.x - 30, autoRec.y - 20);
+}
+function drawPostRecs() {
+    const short = {'5-HT1A (Gi)': '1A', '5-HT2A (Gq)': '2A', '5-HT3 (канал)': '3'};
+    for (let r of postRecs) {
+        const rSize = 14 + Math.max(0, r.flash) * 7;
+        if (r.flash > 0) { ctx.globalAlpha = Math.max(0, r.flash) * 0.5; ctx.fillStyle = r.color; ctx.beginPath(); ctx.arc(r.x, r.y, rSize + 7, 0, Math.PI * 2); ctx.fill(); ctx.globalAlpha = 1; }
+        const rg = ctx.createLinearGradient(r.x, r.y - rSize, r.x, r.y + rSize);
+        rg.addColorStop(0, r.occ ? '#ff9cc9' : r.color);
+        rg.addColorStop(1, r.occ ? '#d4548f' : shade(r.color, -25));
+        ctx.fillStyle = rg; ctx.strokeStyle = '#000'; ctx.lineWidth = 2;
+        ctx.fillRect(r.x - rSize, r.y - rSize, rSize * 2, rSize * 2);
+        ctx.strokeRect(r.x - rSize, r.y - rSize, rSize * 2, rSize * 2);
+        ctx.fillStyle = '#000'; ctx.font = 'bold 9px Courier New'; ctx.textAlign = 'center';
+        ctx.fillText(short[r.type], r.x, r.y + 3);
+        ctx.fillStyle = '#222'; ctx.font = '9px Courier New';
+        ctx.fillText('n=' + r.bindings, r.x, r.y + 30);
+        ctx.textAlign = 'left';
+        ctx.globalAlpha = 0.12; ctx.fillStyle = r.color;
+        ctx.beginPath(); ctx.arc(r.x, r.y, r.radius, 0, Math.PI * 2); ctx.fill();
+        ctx.globalAlpha = 1;
+    }
+}
+function shade(hex, amt) {
+    const p = h => [parseInt(h.slice(1,3),16), parseInt(h.slice(3,5),16), parseInt(h.slice(5,7),16)];
+    const c = p(hex).map(v => Math.max(0, Math.min(255, v + amt)));
+    return `rgb(${c[0]},${c[1]},${c[2]})`;
+}
+function drawCalciumEvents() {
+    for (let e of calciumEvents) {
+        if (e.t < e.duration) {
+            ctx.fillStyle = C_CA;
+            for (let i = 0; i < 3; i++) {
+                const offset = (i - 1) * 15; const progress = e.t / e.duration;
+                ctx.shadowBlur = 10; ctx.shadowColor = C_CA;
+                ctx.beginPath(); ctx.arc(e.x + offset, e.y - 15 + progress * 15, 4, 0, Math.PI * 2); ctx.fill();
+                ctx.shadowBlur = 0;
+            }
+            ctx.fillStyle = '#006622'; ctx.font = 'bold 10px Courier New';
+            ctx.fillText('Ca²⁺', e.x - 12, e.y - 22);
+        }
+    }
+}
+function drawCortisol() {
+    for (let c of cortisolMols) {
+        ctx.fillStyle = C_CORT; ctx.strokeStyle = '#cc9900'; ctx.lineWidth = 1;
+        ctx.beginPath();
+        for (let i = 0; i < 10; i++) {
+            const r = i % 2 === 0 ? 7 : 3; const a = i * Math.PI / 5 - Math.PI / 2;
+            const px = c.x + Math.cos(a) * r, py = c.y + Math.sin(a) * r;
+            if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+        }
+        ctx.closePath(); ctx.fill(); ctx.stroke();
+    }
+    if (cortisolMols.length > 0) { ctx.fillStyle = '#cc9900'; ctx.font = '10px Courier New'; ctx.fillText('Кортизол', 320, 70); }
+}
+function drawReceptorFlashes() {
+    for (let f of receptorFlashes) {
+        const alpha = 1 - f.t / 0.8;
+        ctx.strokeStyle = f.color; ctx.globalAlpha = alpha; ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.arc(f.x, f.y, 25 + f.t * 20, 0, Math.PI * 2); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+}
+function drawMolecules() {
+    for (let m of molecules) {
+        if (m.state === 'bound' || m.state === 'auto') continue;
+        let col = m.recycled ? (m.degradation ? C_5HT_DEGRAD : C_5HT_RECYCLED) : C_5HT;
+        if (m.state === 'trp') col = C_TRP;
+        if (m.state === 'htp') col = C_5HTP;
+        if (m.state === 'kyn') col = C_KYN;
+        if (m.state === 'kyna') col = C_KYNA;
+        if (m.state === 'quin') col = C_QUIN;
+        ctx.strokeStyle = 'rgba(255,255,255,0.7)'; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.arc(m.x, m.y, 6, 0, Math.PI * 2); ctx.stroke();
+        ctx.fillStyle = col;
+        ctx.beginPath(); ctx.arc(m.x, m.y, 5, 0, Math.PI * 2); ctx.fill();
+        if (m.degradation && m.trail.length > 1) {
+            ctx.strokeStyle = C_5HT_DEGRAD; ctx.globalAlpha = 0.4; ctx.lineWidth = 1.5;
+            ctx.beginPath(); ctx.moveTo(m.trail[0].x, m.trail[0].y);
+            for (let i = 1; i < m.trail.length; i++) ctx.lineTo(m.trail[i].x, m.trail[i].y);
+            ctx.stroke(); ctx.globalAlpha = 1;
+        }
+    }
+}
+function drawHIAA() {
+    for (let f of hiaaFlashes) {
+        ctx.fillStyle = 'rgba(200,60,60,' + (1 - f.t / 1.5) + ')';
+        ctx.font = '11px Courier New'; ctx.fillText('5-HIAA', f.x + 25, f.y - 10);
+    }
+}
+function drawLabels() {
+    ctx.fillStyle = '#000'; ctx.font = '12px Courier New';
+    ctx.fillText('Пресинаптический нейрон', 620, 15);
+    ctx.fillText('VMAT', 380, 55);
+    ctx.textAlign = 'right';
+    ctx.fillText('Синаптическая щель →', CLEFT_LEFT - 8, 365);
+    ctx.textAlign = 'left';
+}
+function drawHistory() {
+    const px = 300, py = 545, pw = 440, ph = 130;
+    ctx.fillStyle = 'rgba(255,255,255,0.93)'; ctx.strokeStyle = '#333'; ctx.lineWidth = 2;
+    ctx.fillRect(px, py, pw, ph); ctx.strokeRect(px, py, pw, ph);
+    ctx.fillStyle = '#000'; ctx.font = 'bold 11px Courier New';
+    ctx.fillText('ИСТОРИЯ 180с', px + 10, py + 16);
+    ctx.fillStyle = '#008877'; ctx.fillText('— выброс (мол/с, 0-4)', px + 110, py + 16);
+    ctx.fillStyle = '#bb2222'; ctx.fillText('— щель (мол, 0-80)', px + 300, py + 16);
+    ctx.strokeStyle = '#ddd'; ctx.lineWidth = 1;
+    for (let g = 1; g < 4; g++) {
+        const gy = py + 24 + (ph - 40) * g / 4;
+        ctx.beginPath(); ctx.moveTo(px + 8, gy); ctx.lineTo(px + pw - 8, gy); ctx.stroke();
+    }
+    if (histRel.length < 2) {
+        ctx.fillStyle = '#888'; ctx.font = '10px Courier New';
+        ctx.fillText('накопление данных...', px + 150, py + 75);
+        return;
+    }
+    const n = histRel.length;
+    const x0 = px + 8, x1 = px + pw - 8;
+    const yBase = py + ph - 12, yTop = py + 24;
+    // v9.2 smooth_history: рисуем сглаженную копию (данные histRel не трогаем)
+    const relPlot = MODULES.smooth_history ? smoothSeries(histRel, 3) : histRel;
+    ctx.strokeStyle = '#008877'; ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i = 0; i < n; i++) {
+        const x = x0 + (i / 179) * (x1 - x0);
+        const y = yBase - Math.min(1, relPlot[i] / 4) * (yBase - yTop);
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    ctx.strokeStyle = '#bb2222'; ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i = 0; i < n; i++) {
+        const x = x0 + (i / 179) * (x1 - x0);
+        const y = yBase - Math.min(1, histCleft[i] / 80) * (yBase - yTop);
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    ctx.fillStyle = '#888'; ctx.font = '9px Courier New';
+    ctx.fillText('-180с', x0, py + ph - 2);
+    ctx.textAlign = 'right';
+    ctx.fillText('сейчас', x1, py + ph - 2);
+    ctx.textAlign = 'left';
+}
+function drawLegend() {
+    const x = 880, y = 505, w = 310, h = 160;
+    ctx.fillStyle = 'rgba(255,255,255,0.95)'; ctx.strokeStyle = '#000'; ctx.lineWidth = 2;
+    ctx.fillRect(x, y, w, h); ctx.strokeRect(x, y, w, h);
+    ctx.fillStyle = '#000'; ctx.font = 'bold 12px Courier New';
+    ctx.fillText('ЛЕГЕНДА ЦВЕТОВ', x + 12, y + 18);
+    const items = [
+        [C_5HT, '5-HT свежий (в щели)'],
+        [C_5HT_RECYCLED, '5-HT → везикула'],
+        [C_5HT_DEGRAD, '5-HT → MAO'],
+        [C_KYN, 'KYN'], [C_KYNA, 'KYNA'], [C_QUIN, 'QUIN'],
+        [C_CORT, 'Кортизол'], [C_SSRI, 'СИОЗС на SERT']
+    ];
+    let yy = y + 36;
+    for (let it of items) {
+        ctx.fillStyle = it[0];
+        ctx.beginPath(); ctx.arc(x + 18, yy - 4, 5, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = '#000'; ctx.font = '10px Courier New';
+        ctx.fillText(it[1], x + 32, yy); yy += 16;
+    }
+}
+function drawDashboard() {
+    const x = 880, y = 20, w = 310, h = 470;
+    ctx.fillStyle = '#fff'; ctx.strokeStyle = '#000'; ctx.lineWidth = 2;
+    ctx.fillRect(x, y, w, h); ctx.strokeRect(x, y, w, h);
+    const prm = P();
+    const tdoEff = prm.tdo * tdoRamp;
+    const stressLevel = getStress();
+    // Правка 12: статус по новой логике — контроль это НЕ гомеостаз, а
+    // «хронический стресс / дисбаланс»; спокойствие достигается только Ф3.
+    let status, statusColor;
+    if (stressLevel < 0.3) { status = 'СПОКОЙСТВИЕ (терапия успешна)'; statusColor = '#008844'; }
+    else if (stressLevel < 0.7) { status = 'ПЕРЕХОД / ЧАСТИЧНАЯ РЕМИССИЯ'; statusColor = '#cc8800'; }
+    else { status = 'ХРОНИЧЕСКИЙ СТРЕСС / ДИСБАЛАНС'; statusColor = '#cc2222'; }
+    ctx.fillStyle = '#000'; ctx.font = 'bold 14px Courier New';
+    ctx.fillText('ДАШБОРД · ' + status, x + 12, y + 24);
+    const relWin = ringSum('rel'), upWin = ringSum('up'), synWin = ringSum('syn'), maoWin = ringSum('mao');
+    const kynWin = ringSum('kyn'), kynaWin = ringSum('kyna'), quinWin = ringSum('quin');
+    const diffWin = ringSum('diff'), lostWin = ringSum('lost');
+    const ev2Win = ringSum('ev2'), ev3Win = ringSum('ev3'), ev1Win = ringSum('ev1');
+    const cleftN = molecules.filter(m => m.state === 'cleft').length;
+    const range = normRange();
+    const inRange = cleftN >= range[0] && cleftN <= range[1];
+    const cleftColor = inRange ? '#008844' : '#cc8800';
+    const evTotal = postRecs[0].bindings + postRecs[1].bindings + postRecs[2].bindings;
+    const relHz = (relWin / 10).toFixed(1);
+    const upHz = (upWin / 10).toFixed(1);
+    ctx.font = '11px Courier New';
+    const lines = [
+        ['Время: ' + simTime.toFixed(1) + ' c', '#00aa00'],
+        ['Выброс: ' + relWin + ' (' + relHz + ' Гц)', '#008877'],
+        ['Захват SERT: ' + upWin + ' (' + upHz + ' Гц)', '#5566cc'],
+        ['MAO окно: ' + maoWin + ' | сессия: ' + maoTotal, '#cc4444'],
+        ['Синтез 5-HT: ' + synWin, '#886622'],
+        ['KYN: ' + kynWin + ' (KYNA=' + kynaWin + ' QUIN=' + quinWin + ')', '#7744cc'],
+        ['Диффузия: ' + diffWin + ' / Потеряно: ' + lostWin, '#999999'],
+        ['5-HT в щели: ' + cleftN + ' (~' + (cleftN * NM_PER_MOL) + ' нМ)', cleftColor],
+        ['  норма фазы: ' + (range[0]*NM_PER_MOL) + '-' + (range[1]*NM_PER_MOL) + ' нМ', cleftColor],
+        ['--- СИГНАЛИЗАЦИЯ (сессия) ---', '#000000'],
+        ['≥1 связь: ' + signaledTotal, '#cc2277'],
+        ['1A=' + postRecs[0].bindings + ' 2A=' + postRecs[1].bindings + ' 3=' + postRecs[2].bindings, '#4488ff'],
+        ['Распр: ' + (evTotal ? Math.round(postRecs[0].bindings/evTotal*100) : 0) + '/' + (evTotal ? Math.round(postRecs[1].bindings/evTotal*100) : 0) + '/' + (evTotal ? Math.round(postRecs[2].bindings/evTotal*100) : 0), '#4488ff'],
+        ['2A+3/10с: ' + (ev2Win + ev3Win) + ' (нагрузка/побочки)', '#ff8844'],
+        ['--- ТЕРАПИЯ ---', '#000000'],
+        ['Фаза: ' + THERAPY_PHASES[targetPhase].name, '#b8860b'],
+        ['Блок SERT: ' + Math.round(therapy.block * 100) + '%', '#b8860b'],
+        ['Десенс авто: ' + Math.round(therapy.desens * 100) + '% | Постадапт: ' + Math.round(therapy.adapt * 100) + '%', '#b8860b'],
+        ['--- РЕГУЛЯЦИЯ ---', '#000000'],
+        ['Уровень тревоги: ' + Math.round(stressLevel * 100) + '%', '#cc2222'],
+        ['Кортизол: ' + Math.round(prm.cortisol * 100) + '%', '#cc9900'],
+        ['TDO: ' + Math.round(tdoEff * 100) + '% (ramp ' + Math.round(tdoRamp * 100) + '%)', '#7744cc'],
+    ];
+    // v9.1: метрика истощения синтеза — ДОБАВЛЯЕТСЯ, старые строки не тронуты
+    if (MODULES.tph2_exhaustion) {
+        lines.push(['Истощение Tph2: ' + Math.round(exhaustion * 100) + '% (synth x' + (1 - 0.35*exhaustion).toFixed(2) + ')', '#886622']);
+    }
+    lines = lines.concat([
+        ['MAO: ' + Math.round(prm.mao * 100) + '% | 1Aчув: ' + Math.round(prm.ht1a * 100) + '%', '#cc4444'],
+        ['2Aчув: ' + Math.round(prm.ht2a * 100) + '% | 3чув: ' + Math.round(prm.ht3 * 100) + '%', '#4488ff'],
+        // правка 12: срез распределения сигнальных событий за 10 с — при хрон.
+        // тревоге ожидается перекос в сторону 2A/3 («возбуждение»), при Ф3 — к 1A.
+        ['События 10с 1A/2A/3: ' + ev1Win + '/' + ev2Win + '/' + ev3Win, '#4488ff'],
+    ]);
+    // v9.0-step1: строки диагностики (ДОБАВЛЯЮТСЯ, старые не трогаем)
+    if (DIAG.contacts) {
+        for (let r of postRecs) {
+            lines.push(['ДИАГ ' + r.type.slice(5) + ': конт=' + r.diagContacts + ' связ=' + r.diagBindOk, '#888888']);
+        }
+    }
+    lines.push(['Барабан: ' + vesicles.map(v => v.count).join(','), '#886622']);
+    lines.push(['(окно 10с; 1 мол ≈ 2 нМ)', '#888888']);
+    let yy = y + 46;
+    for (let L of lines) { ctx.fillStyle = L[1]; ctx.fillText(L[0], x + 12, yy); yy += 18; }
+    ctx.fillStyle = statusColor; ctx.font = 'bold 14px Courier New';
+    ctx.fillText('СТАТУС: ' + status, x + 12, y + h - 14);
+}
+function drawTooltip() {
+    if (mouse.x > 870) return;
+    let hit = null;
+    for (let t of tooltips) { if (dist(mouse.x, mouse.y, t.x, t.y) < t.r) { hit = t; break; } }
+    if (!hit) return;
+    const maxLen = Math.max(hit.title.length, ...hit.lines.map(l => l.length));
+    const bw = maxLen * 7 + 20, bh = hit.lines.length * 14 + 30;
+    let bx = mouse.x + 15, by = mouse.y + 15;
+    if (bx + bw > W - 5) bx = mouse.x - bw - 15;
+    if (by + bh > H - 5) by = mouse.y - bh - 15;
+    ctx.fillStyle = 'rgba(255,255,240,0.97)'; ctx.strokeStyle = '#333'; ctx.lineWidth = 2;
+    ctx.fillRect(bx, by, bw, bh); ctx.strokeRect(bx, by, bw, bh);
+    ctx.fillStyle = '#000'; ctx.font = 'bold 12px Courier New';
+    ctx.fillText(hit.title, bx + 10, by + 18);
+    ctx.font = '11px Courier New';
+    let yy = by + 34;
+    for (let l of hit.lines) { ctx.fillText(l, bx + 10, yy); yy += 14; }
+}
+
+let last = performance.now();
+function loop(now) {
+    const dt = Math.min((now - last) / 1000, 0.05);
+    last = now;
+    update(dt); draw();
+    requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
