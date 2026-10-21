@@ -33,7 +33,7 @@
 </div>
 <script>
 // ===== ФЛАГИ МОДУЛЕЙ (v9.5 FIX: объявлены ДО первого использования, TDZ-баг) =====
-// MODULES перенесён выше draw() (см. VISUAL v9.9 блок) — TDZ-фикс
+const MODULES = { tph2_exhaustion: true, smooth_history: true, somatic_v2: true, ht2c: true };
 
 const cv = document.getElementById('cv');
 const ctx = cv.getContext('2d');
@@ -1071,7 +1071,8 @@ function lerpColor(c1, c2, t) {
 }
 
 /* ===== VISUAL v9.9 "Гистология" (вариант A): ТОЛЬКО отрисовка, логика не тронута ===== */
-var MODULES = { tph2_exhaustion: true, smooth_history: true, somatic_v2: true, ht2c: true };   // hoisted выше первого использования (line 222) — TDZ-фикс
+// FIX v9.9b: определение MODULES возвращено на позицию строки 36 (как в v9.8),
+// чтобы исключить перекрытие одноимённым const из-за var-hoisting (TDZ-ловушка).
 const VIS = true;   // false = поведение идентично v9.8
 // Детерминированный PRNG для статичных текстур (не влияет на физику — rng() не трогаем)
 let _visSeed = 12345;
