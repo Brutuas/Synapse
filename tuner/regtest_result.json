@@ -1,0 +1,62 @@
+{
+  "F0": {
+    "n_samples": 0,
+    "cleft_mean": null,
+    "cleft_min": null,
+    "cleft_max": null,
+    "relHz_mean": null,
+    "sertHz_mean": null,
+    "mao10_mean": null,
+    "dist_last": null,
+    "soma_last": null,
+    "exh_last": null,
+    "pi_last": null,
+    "ok_windows": "0/2",
+    "verdict_tail": "0"
+  },
+  "F1": {
+    "n_samples": 0,
+    "cleft_mean": null,
+    "cleft_min": null,
+    "cleft_max": null,
+    "relHz_mean": null,
+    "sertHz_mean": null,
+    "mao10_mean": null,
+    "dist_last": null,
+    "soma_last": null,
+    "exh_last": null,
+    "pi_last": null,
+    "ok_windows": "0/2",
+    "verdict_tail": "0"
+  },
+  "F2": {
+    "n_samples": 0,
+    "cleft_mean": null,
+    "cleft_min": null,
+    "cleft_max": null,
+    "relHz_mean": null,
+    "sertHz_mean": null,
+    "mao10_mean": null,
+    "dist_last": null,
+    "soma_last": null,
+    "exh_last": null,
+    "pi_last": null,
+    "ok_windows": "0/2",
+    "verdict_tail": "0"
+  },
+  "F3": {
+    "n_samples": 0,
+    "cleft_mean": null,
+    "cleft_min": null,
+    "cleft_max": null,
+    "relHz_mean": null,
+    "sertHz_mean": null,
+    "mao10_mean": null,
+    "dist_last": null,
+    "soma_last": null,
+    "exh_last": null,
+    "pi_last": null,
+    "ok_windows": "0/2",
+    "verdict_tail": "0"
+  }
+}

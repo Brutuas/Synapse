@@ -14,9 +14,8 @@
 </style>
 </head>
 <body>
-<button id="modeBtn">РЕЖИМ: СПОКОЙСТВИЕ → нажать для ТРЕВОГИ</button>
 <div id="therapyBar">
-    <button data-ph="0" class="active">КОНТРОЛЬ (без СИОЗС)</button>
+    <button data-ph="0" class="active">КОНТРОЛЬ (хрон. тревога, без СИОЗС)</button>
     <button data-ph="1">Ф1 ОСТРАЯ БЛОКАДА</button>
     <button data-ph="2">Ф2 ДЕСЕНСИТИЗАЦИЯ</button>
     <button data-ph="3">Ф3 ПОСТАДАПТАЦИЯ</button>
@@ -35,7 +34,6 @@
 <script>
 const cv = document.getElementById('cv');
 const ctx = cv.getContext('2d');
-const btn = document.getElementById('modeBtn');
 const W = 1200, H = 700;
 
 const PRE_CX = 440, PRE_CY = 150, PRE_RX = 420, PRE_RY = 130;
@@ -61,7 +59,12 @@ const C_SERT='#2266cc', C_REC='#cc2277', C_MAO='#cc3333';
 const C_AUTO='#00aa55', C_NA='#3399ff', C_CA='#44dd44', C_CORT='#ffcc00';
 const C_SSRI='#ffcc00';
 
-let stressLevel = 0, targetStress = 0;
+// НОВАЯ ЛОГИКА (правка 12): режим переключателя «СПОКОЙСТВИЕ/ТРЕВОГА» удалён.
+// КОНТРОЛЬ (F0) теперь физиологически = ХРОНИЧЕСКАЯ ТРЕВОГА: stressLevel жёстко
+// зафиксирован на базовом уровне 0.85. Лечение СИОЗС (Феварин) — фазы Ф1–Ф3,
+// в которых стресс постепенно снижается постадаптацией (prm.adaptStress).
+const STRESS_BASE = 0.85;          // хроническая тревога в контроле
+function getStress(){ return STRESS_BASE * (1 - 0.75 * therapy.adapt); }
 const NM_PER_MOL = 2;
 let tdoRamp = 0;
 let simTime = 0;
@@ -77,19 +80,25 @@ const THERAPY_PHASES = [
 let targetPhase = 0;
 let therapy = {block:0, desens:0, adapt:0};
 
+// Правка 12b: ауторецепторная петля в контроле (хрон. тревога) должна быть
+// ГИПЕРактивной, а не «спящей»: при s≈0.85 старая формула (1-0.8*s) давала
+// autoSens≈0.32 — обратное торможение выброса почти исчезало, и вместо
+// аритмии «пик→пауза» получался ровный низкий уровень. Теперь автоSens
+// растёт со стрессом (гиперреактивные 1A-ауторецепторы при тревоге), а
+// СИОЗС-десенситизация (therapy.desens) снимает это торможение в Ф2/Ф3.
 function P(){
-    const s = stressLevel;
+    const s = getStress();
     return {
         cortisol: 0.1+0.9*s,
         tdo: 0.03+0.32*s,
-        synth: (0.85+0.15*s) * (1 - 0.3*therapy.adapt),
-        caInterval: (0.9-0.35*s) * (1 + 0.8 * therapy.block * (1 - therapy.desens)),
+        synth: (1.6+0.3*s) * (1 - 0.15*therapy.adapt),   // правка 13c
+        caInterval: (0.9-0.35*s) * (1 + 0.35 * therapy.block * (1 - therapy.desens)),  // правка 13c
         sert: 1.0+0.5*s,
         mao: 1.0+0.5*s,
-        autoSens: (1.0-0.8*s) * (1 - therapy.desens),
-        ht1a: (1.0-0.6*s) * (1 + 0.5*therapy.adapt),
-        ht2a: (1.0+0.8*s) * (1 - 0.45*therapy.adapt),
-        ht3:  (1 - 0.3*therapy.adapt),
+        autoSens: (0.45 + 0.55*s) * (1 - 0.9*therapy.desens),
+        ht1a: (0.30-0.10*s) * (1 + 0.5*therapy.adapt),   // правка 13b
+        ht2a: (1.0+0.2*s) * (1 - 0.15*therapy.adapt),    // правка 13b
+        ht3:  (0.8 - 0.2*therapy.adapt),
         kynShift: 0.6+0.25*s,
         maoFraction: 0.45+0.3*s
     };
@@ -108,7 +117,7 @@ function ringInit(){
     ring = { rel:Array(RING_N).fill(0), up:Array(RING_N).fill(0), syn:Array(RING_N).fill(0),
              mao:Array(RING_N).fill(0), kyn:Array(RING_N).fill(0), kyna:Array(RING_N).fill(0),
              quin:Array(RING_N).fill(0), diff:Array(RING_N).fill(0), lost:Array(RING_N).fill(0),
-             ev2:Array(RING_N).fill(0), ev3:Array(RING_N).fill(0) };
+             ev2:Array(RING_N).fill(0), ev3:Array(RING_N).fill(0), ev1:Array(RING_N).fill(0) };
 }
 ringInit();
 function ringTick(dt){
@@ -135,9 +144,9 @@ const DOCK = {x: 520, y: CLEFT_TOP - 12};
 
 let revolverRotation = 0, revolverDisplay = 0;
 let vesicles = [
-    {count: 2, pool: 'RRP', speed: 1.0, t: 0, state: 'barrel', x: 0, y: 0},
-    {count: 2, pool: 'Rec', speed: 0.8, t: 0, state: 'barrel', x: 0, y: 0},
-    {count: 2, pool: 'Res', speed: 0.5, t: 0, state: 'barrel', x: 0, y: 0}
+    {count: 4, pool: 'RRP', speed: 1.0, t: 0, state: 'barrel', x: 0, y: 0},
+    {count: 4, pool: 'Rec', speed: 0.8, t: 0, state: 'barrel', x: 0, y: 0},
+    {count: 4, pool: 'Res', speed: 0.5, t: 0, state: 'barrel', x: 0, y: 0}
 ];
 
 const serts = [
@@ -148,9 +157,9 @@ let sertRerollTimer = 0;
 const autoRec = {x: 710, y: CLEFT_TOP, occupied: null, t: 0, active: false, activeT: 0, pulse: 0};
 
 const postRecs = [
-    {x: 420, y: CLEFT_BOT - 5, type: '5-HT1A (Gi)',   aff: 3.0,  color: '#4488ff', radius: 21, bindings: 0, flash: 0, occ: null, t: 0},
-    {x: 540, y: CLEFT_BOT - 5, type: '5-HT2A (Gq)',   aff: 0.8,  color: '#ff8844', radius: 21, bindings: 0, flash: 0, occ: null, t: 0},
-    {x: 620, y: CLEFT_BOT - 5, type: '5-HT3 (канал)', aff: 0.25, color: '#ffdd00', radius: 21, bindings: 0, flash: 0, occ: null, t: 0}
+    {x: 420, y: CLEFT_BOT - 5, type: '5-HT1A (Gi)',   aff: 0.9,  color: '#4488ff', radius: 21, bindings: 0, flash: 0, occ: null, t: 0},
+    {x: 540, y: CLEFT_BOT - 5, type: '5-HT2A (Gq)',   aff: 1.7,  color: '#ff8844', radius: 21, bindings: 0, flash: 0, occ: null, t: 0},
+    {x: 620, y: CLEFT_BOT - 5, type: '5-HT3 (канал)', aff: 0.2, color: '#ffdd00', radius: 21, bindings: 0, flash: 0, occ: null, t: 0}
 ];
 
 const SYN = {trp: [220, 60], branch: [250, 100], htp: [360, 160], ht: [400, 200]};
@@ -225,14 +234,7 @@ function vesicleVisualPos(i) {
     return {x: v.x, y: v.y};
 }
 
-btn.addEventListener('click', () => {
-    targetStress = targetStress === 0 ? 1 : 0;
-    postRecs.forEach(r => r.bindings = 0);
-    signaledTotal = 0;
-    maoTotal = 0;
-    btn.textContent = targetStress === 1 ? 'РЕЖИМ: ТРЕВОГА → нажать для СПОКОЙСТВИЯ' : 'РЕЖИМ: СПОКОЙСТВИЕ → нажать для ТРЕВОГИ';
-    btn.classList.toggle('stress', targetStress === 1);
-});
+// Правка 12: переключатель режимов удалён — базовое состояние = хрон. тревога.
 
 document.querySelectorAll('#therapyBar button').forEach(b => {
     b.addEventListener('click', () => {
@@ -253,7 +255,7 @@ document.querySelectorAll('#therapyBar button').forEach(b => {
 });
 
 // Кнопки тестовой панели
-(function(){
+{
     const ta = document.getElementById('testReport');
     document.getElementById('btnReport').addEventListener('click', () => {
         ta.style.display = (ta.style.display === 'none') ? 'block' : 'none';
@@ -275,20 +277,24 @@ document.querySelectorAll('#therapyBar button').forEach(b => {
         logTimer = 0;
         renderTestReport();
     });
-})();
+}
 
-// Правка 4: целевые коридоры занятости щели (число молекул), калиброваны по
-// броуновской реплике под стац. режимы фаз CTRL/F1/F2/F3 в спокойствии/тревоге.
-// [спокойствие, тревога] для каждой из 4 фаз.
-const FIXED_TARGETS = {
-    calm: [[6,15],[19,28],[19,28],[19,28]],
-    str:  [[6,17],[17,28],[20,28],[20,28]]
-};
+// Правка 4 + 12: целевые коридоры занятости щели (число молекул, 1 мол ≈ 2 нМ).
+// НОВАЯ ЛОГИКА: базовое состояние = ХРОНИЧЕСКАЯ ТРЕВОГА (дисбаланс), поэтому
+// контрольный коридор — низкий и широкий (не «гомеостаз», а неустойчивый уровень).
+// Ф1–Ф3 (лечение СИОЗС/Феварин) — восстановление к верхнему физиологическому
+// диапазону. Коридор выбран по прежним калибровкам стресс-режима.
+const FIXED_TARGETS = [
+    [6, 17],     // КОНТРОЛЬ: хрон. тревога — нестабильно, низко/короткие пики
+    [17, 28],    // Ф1 острая блокада SERT
+    [20, 28],    // Ф2 десенситизация ауторецепторов
+    [20, 28]     // Ф3 постадаптация — терапевтический баланс
+];
 // Сдвиг целевого центра по фазе (антистатическая подстройка ПИ-регулятора):
 // при block=92% (Ф1–Ф3) «топливо» для выброса ограничено и удержание нижней
 // половины коридора физически недостижимо — цель ставится на верхнюю половину.
 // Величины получены автоподбором по броуновской реплике (усреднение по сидам).
-const PHASE_BIAS = [0, +3, +1, +2];   // F3: смещён вверх — при 92% блоке SERT
+const PHASE_BIAS = [0, +3, 0, +2];   // F3: смещён вверх — при 92% блоке SERT
                                       // нижняя половина коридора физически
                                       // недостижима (по автоподбору реплики)
 // Правка 4d: вторая ручка контура — вероятность слияния (release probability),
@@ -300,7 +306,7 @@ const RELPROB_BASE = [0.75, 0.85, 0.9, 0.9];   // базовая p(fusion) по 
 let relProb = RELPROB_BASE[0];                  // текущая вероятность слияния (обновляется каждый кадр)
 let relInteg = 0;                               // интеграл второго контура
 function normRange(){
-    return (stressLevel < 0.5 ? FIXED_TARGETS.calm : FIXED_TARGETS.str)[targetPhase];
+    return FIXED_TARGETS[targetPhase];
 }
 function targetCenter(){
     const r = normRange();
@@ -376,7 +382,7 @@ function logSnapshot(dt){
     const mean = logAcc.sumN / logAcc.n;
     const ok = mean >= range[0] && mean <= range[1];
     testLog.push({
-        t: simTime.toFixed(0), phase: targetPhase, stress: stressLevel.toFixed(2),
+        t: simTime.toFixed(0), phase: targetPhase, stress: getStress().toFixed(2),
         mean: mean.toFixed(1), lo: range[0], hi: range[1],
         relHz: (ringSum('rel') / 10).toFixed(2),   // молекул/с за последние 10 с
         upHz: (ringSum('up') / 10).toFixed(2),
@@ -419,8 +425,10 @@ function update(dt) {
 
     const prm = P();
 
-    if (targetStress > stressLevel) stressLevel = Math.min(targetStress, stressLevel + 0.2 * dt);
-    else stressLevel = Math.max(targetStress, stressLevel - 0.1 * dt);
+    // Правка 12: стресс больше не «переключается» пользователем — базовый уровень
+    // хронической тревоги (0.85) плавно снижается терапией через therapy.adapt
+    // (см. getStress()). tdoRamp остаётся активной, т.к. стресс > 0.5 всегда.
+    const stressLevel = getStress();
 
     if (stressLevel > 0.5) tdoRamp = Math.min(1, tdoRamp + dt / 12);
     else tdoRamp = Math.max(0, tdoRamp - dt / 5);
@@ -428,11 +436,17 @@ function update(dt) {
 
     ringTick(dt);
 
-    sertRerollTimer += dt;
-    if (sertRerollTimer > 10.0) {
-        sertRerollTimer = 0;
-        for (let s of serts) s.blocked = Math.random() < therapy.block;
-    }
+    // Правка 11: непрерывная стохастическая блокада SERT.
+    // Раньше статус blocked перебрасывался ОДИН монетный бросок раз в 10 с для
+    // обоих транспортеров сразу: при block=0.92 это давало режим «взрыв-затишье»
+    // (~92% времени щель не чистится вовсе, 8% — чистится обоими SERT яростно).
+    // ПИ-регулятор за окном оборота tauAU=10 с не успевал компенсировать такую
+    // медленную модуляцию — отсюда дрейф и пила в F1–F3 (23.5→8.9 за фазу).
+    // Теперь каждый SERT независимо пере-bерётся каждый кадр с вероятностью
+    // block: клиренс становится непрерывным процессом со средним темпом
+    // block*rate_free — физически корректная картина конкурентного ингибирования
+    // СИОЗС (молекулы препарата динамически занимают/покидают сайт транспорта).
+    for (let s of serts) s.blocked = Math.random() < therapy.block;
 
     let cytosolCount = 0;
     for (let m of molecules) if (m.state === 'cytosol') cytosolCount++;
@@ -688,6 +702,7 @@ function update(dt) {
                         r.occ = m; r.bindings++;
                         if (r.type.startsWith('5-HT2A')) ringAdd('ev2');
                         if (r.type.startsWith('5-HT3')) ringAdd('ev3');
+                        if (r.type.startsWith('5-HT1A')) ringAdd('ev1');
                         if (!m.everBound) { m.everBound = true; signaledTotal++; }
                         m.state = 'bound'; m.target = r; m.t = 0;
                         r.flash = 1.0;
@@ -707,7 +722,7 @@ function update(dt) {
             // (физически: выход из активационной зоны в объём вне щели)
         }
         else if (m.state === 'bound') {
-            if (m.t > 1.0 / m.target.aff) {
+            if (m.t > 0.5 + 0.5 / m.target.aff) {   // правка 13a
                 m.target.occ = null;
                 m.state = 'cleft';
                 m.t = 0;
@@ -753,6 +768,7 @@ function lerpColor(c1, c2, t) {
 
 function draw() {
     ctx.clearRect(0, 0, W, H);
+    const stressLevel = getStress();   // правка 12: фон отражает уровень тревоги
     ctx.fillStyle = lerpColor('#fafaf5', '#ffe2e2', stressLevel);
     ctx.fillRect(0, 0, W, H);
     drawPre(); drawPostStrip();
@@ -763,6 +779,7 @@ function draw() {
     drawMolecules(); drawHIAA(); drawLabels(); drawHistory(); drawLegend(); drawDashboard(); drawTooltip();
 }
 function drawPre() {
+    const stressLevel = getStress();
     const grad = ctx.createRadialGradient(PRE_CX - 80, PRE_CY - 60, 40, PRE_CX, PRE_CY, PRE_RX);
     grad.addColorStop(0, lerpColor('#fff7a0', '#ffd977', stressLevel));
     grad.addColorStop(0.55, lerpColor('#ffe14a', '#ffb84d', stressLevel));
@@ -794,6 +811,7 @@ function drawPre() {
     ctx.beginPath(); ctx.moveTo(CLEFT_RIGHT, yMem(CLEFT_RIGHT)); ctx.lineTo(CLEFT_RIGHT, CLEFT_TOP); ctx.stroke();
 }
 function drawPostStrip() {
+    const stressLevel = getStress();
     const x0 = CLEFT_LEFT, y0 = CLEFT_BOT, w = CLEFT.w, h = 70, r = 16;
     ctx.save();
     ctx.shadowColor = 'rgba(0,0,0,0.25)'; ctx.shadowBlur = 14; ctx.shadowOffsetY = 5;
@@ -1092,16 +1110,19 @@ function drawDashboard() {
     ctx.fillRect(x, y, w, h); ctx.strokeRect(x, y, w, h);
     const prm = P();
     const tdoEff = prm.tdo * tdoRamp;
+    const stressLevel = getStress();
+    // Правка 12: статус по новой логике — контроль это НЕ гомеостаз, а
+    // «хронический стресс / дисбаланс»; спокойствие достигается только Ф3.
     let status, statusColor;
-    if (stressLevel < 0.3) { status = 'ГОМЕОСТАЗ'; statusColor = '#008844'; }
-    else if (stressLevel < 0.7) { status = 'ПЕРЕХОД...'; statusColor = '#cc8800'; }
-    else { status = 'ТРЕВОГА'; statusColor = '#cc2222'; }
+    if (stressLevel < 0.3) { status = 'СПОКОЙСТВИЕ (терапия успешна)'; statusColor = '#008844'; }
+    else if (stressLevel < 0.7) { status = 'ПЕРЕХОД / ЧАСТИЧНАЯ РЕМИССИЯ'; statusColor = '#cc8800'; }
+    else { status = 'ХРОНИЧЕСКИЙ СТРЕСС / ДИСБАЛАНС'; statusColor = '#cc2222'; }
     ctx.fillStyle = '#000'; ctx.font = 'bold 14px Courier New';
     ctx.fillText('ДАШБОРД · ' + status, x + 12, y + 24);
     const relWin = ringSum('rel'), upWin = ringSum('up'), synWin = ringSum('syn'), maoWin = ringSum('mao');
     const kynWin = ringSum('kyn'), kynaWin = ringSum('kyna'), quinWin = ringSum('quin');
     const diffWin = ringSum('diff'), lostWin = ringSum('lost');
-    const ev2Win = ringSum('ev2'), ev3Win = ringSum('ev3');
+    const ev2Win = ringSum('ev2'), ev3Win = ringSum('ev3'), ev1Win = ringSum('ev1');
     const cleftN = molecules.filter(m => m.state === 'cleft').length;
     const range = normRange();
     const inRange = cleftN >= range[0] && cleftN <= range[1];
@@ -1130,10 +1151,14 @@ function drawDashboard() {
         ['Блок SERT: ' + Math.round(therapy.block * 100) + '%', '#b8860b'],
         ['Десенс авто: ' + Math.round(therapy.desens * 100) + '% | Постадапт: ' + Math.round(therapy.adapt * 100) + '%', '#b8860b'],
         ['--- РЕГУЛЯЦИЯ ---', '#000000'],
+        ['Уровень тревоги: ' + Math.round(stressLevel * 100) + '%', '#cc2222'],
         ['Кортизол: ' + Math.round(prm.cortisol * 100) + '%', '#cc9900'],
         ['TDO: ' + Math.round(tdoEff * 100) + '% (ramp ' + Math.round(tdoRamp * 100) + '%)', '#7744cc'],
         ['MAO: ' + Math.round(prm.mao * 100) + '% | 1Aчув: ' + Math.round(prm.ht1a * 100) + '%', '#cc4444'],
         ['2Aчув: ' + Math.round(prm.ht2a * 100) + '% | 3чув: ' + Math.round(prm.ht3 * 100) + '%', '#4488ff'],
+        // правка 12: срез распределения сигнальных событий за 10 с — при хрон.
+        // тревоге ожидается перекос в сторону 2A/3 («возбуждение»), при Ф3 — к 1A.
+        ['События 10с 1A/2A/3: ' + ev1Win + '/' + ev2Win + '/' + ev3Win, '#4488ff'],
         ['Барабан: ' + vesicles.map(v => v.count).join(','), '#886622'],
         ['(окно 10с; 1 мол ≈ 2 нМ)', '#888888']
     ];
